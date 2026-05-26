@@ -275,7 +275,7 @@ ${task || "No specific first-turn task was provided. Ask me what to change befor
 
 We will keep using this same ChatGPT conversation for follow-up coding tasks. After you output a tool plan, I will apply it locally with the CLI and then report whether it succeeded. For follow-ups, use the original digest plus the tool plans that were applied as your working model of the repo. If uncertain, ask me to regenerate and paste a fresh --init digest.
 
-When you propose code changes, output ONLY a JSON tool plan in one fenced code block. Do not include prose outside the code block.
+When you propose code changes, put the JSON tool plan first, in one fenced json code block. If you want to say anything else—what changed, which files changed, disclaimers, answers to my questions, testing notes, or any other explanation—put that prose after the code block, outside the code block. Never put prose before the JSON code block.
 
 The JSON must be either an array of tool calls or an object with a "tools" array. Each tool call must be an object with a "tool" field.
 
@@ -327,7 +327,7 @@ Important instructions:
 - Keep edits small and targeted.
 - If you need to change an existing file, use replace_in_file with a large enough exact old string to be unique.
 - Do not invent read/list/shell tools. You only have the tools above.
-- Do not output Markdown explanations when returning the final tool plan; output only the JSON fenced code block.
+- Put the JSON tool plan first. Any explanation or answer must come after the code block, outside the code block.
 
 CODEBASE DIGEST START
 

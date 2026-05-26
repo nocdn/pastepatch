@@ -78,7 +78,7 @@ pastepatch --init . -- --line-numbers --template node
    the original digest plus successfully applied tool plans as its working model
    of the repo, and ask you for a fresh `--init` digest if it becomes uncertain.
 
-2. ChatGPT should respond with only a fenced JSON tool plan, such as:
+2. ChatGPT should respond with a fenced JSON tool plan first, such as:
 
    ```json
    [
@@ -95,6 +95,10 @@ pastepatch --init . -- --line-numbers --template node
      }
    ]
    ```
+
+   If ChatGPT includes notes, explanations, disclaimers, test instructions, or
+   answers to your questions, they should come after the JSON code block. The
+   JSON tool plan should always be the first code block in the response.
 
 3. Apply the tool plan locally:
 
