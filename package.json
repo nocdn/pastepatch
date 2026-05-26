@@ -1,0 +1,20 @@
+{
+  "name": "@nocdn/chat-coding",
+  "version": "0.0.1",
+  "description": "A cli script where I can paste changes that an agent is requesting, and have them be executed",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "chat-coding": "bin/cli.js"
+  },
+  "files": [
+    "bin",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "start": "node ./bin/cli.js"
+  }
+}
