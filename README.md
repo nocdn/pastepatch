@@ -12,6 +12,12 @@ Run without installing:
 npx @nocdn/pastepatch --init
 ```
 
+Or install globally to use `pastepatch` directly from any repo:
+
+```bash
+npm install -g @nocdn/pastepatch
+```
+
 This project uses npm for development.
 
 ## Usage
@@ -19,12 +25,16 @@ This project uses npm for development.
 ```bash
 pastepatch --init [path] [options] [-- ingest-options]
 pastepatch --edit [options]
+pastepatch --undo
+pastepatch --log
 ```
 
 | flag | description |
 | --- | --- |
 | `--init` | ask what you want ChatGPT to implement, run `bunx @nocdn/ingest <path> --stdout`, wrap the task and digest with ChatGPT instructions, and copy the full prompt to the clipboard |
 | `--edit` | read the ChatGPT JSON tool plan from the clipboard and apply the file edits |
+| `--undo` | undo the most recent applied pastepatch change set |
+| `--log`, `--last-log` | print the pastepatch log for the current directory |
 | `--path <path>` | project path for `--init`; a positional path also works; defaults to the current directory |
 | `-m`, `--message`, `--task <text>` | provide first-turn instructions for `--init` instead of being asked interactively |
 | `-i`, `--include <pattern>` | forward an include pattern to `@nocdn/ingest`; repeatable |
@@ -96,7 +106,16 @@ pastepatch --init . -- --line-numbers --template node
    running the command. The CLI reads the tool plan from your clipboard,
    previews the parsed tool calls, and asks for confirmation before changing
    files. If the clipboard does not contain valid JSON in the expected tool
-   format, it prints an error and does not change files.
+   format, it prints an error and does not change files. When changes are
+   applied, pastepatch stores an undo snapshot under `.git/pastepatch/history`
+   if the current directory is inside a git repository, so the history is not
+   tracked by git.
+
+4. Undo the last applied pastepatch change set if needed:
+
+   ```bash
+   pastepatch --undo
+   ```
 
 For a non-interactive dry run:
 
@@ -106,6 +125,12 @@ pbpaste | pastepatch --edit --dry-run
 
 `--edit` reads from the clipboard when run interactively, and from stdin when
 input is piped.
+
+To inspect what happened in the current directory:
+
+```bash
+pastepatch --log
+```
 
 ## ChatGPT tool format
 
@@ -128,6 +153,8 @@ than once, the CLI stops with an error unless the call sets
 
 For safety, paths must be relative and must not escape the current directory.
 Details and errors are written to `.pastepatch.log` in the current directory.
+Undo history for applied edits is written under `.git/pastepatch/history` when
+inside a git repository, or `.pastepatch/history` outside git repositories.
 
 ## Develop
 

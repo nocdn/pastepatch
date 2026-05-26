@@ -1,6 +1,6 @@
 {
   "name": "@nocdn/pastepatch",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "A CLI for coding with ChatGPT by generating codebase prompts and applying JSON tool plans",
   "license": "MIT",
   "type": "module",

@@ -3,7 +3,9 @@ import { spawn } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import {
   appendFile,
+  lstat,
   mkdir,
+  readdir,
   readFile,
   rename,
   rm,
@@ -29,6 +31,16 @@ async function main() {
       return;
     }
 
+    if (args.log) {
+      await runLog();
+      return;
+    }
+
+    if (args.undo) {
+      await runUndo(logger);
+      return;
+    }
+
     if (args.init) {
       await runInit(args, packageInfo, logger);
       return;
@@ -39,7 +51,7 @@ async function main() {
       return;
     }
 
-    throw new Error(`Choose --init or --edit. Run ${packageInfo.name} --help for usage.`);
+    throw new Error(`Choose --init, --edit, --undo, or --log. Run ${packageInfo.name} --help for usage.`);
   } catch (error) {
     await logger(`ERROR ${error.stack || error.message}`);
     process.stderr.write(`Error: ${error.message}\n`);
@@ -54,6 +66,8 @@ function parseArgs(argv, packageInfo) {
     version: false,
     init: false,
     edit: false,
+    undo: false,
+    log: false,
     path: ".",
     stdout: false,
     noClipboard: false,
@@ -85,6 +99,16 @@ function parseArgs(argv, packageInfo) {
 
     if (arg === "--edit") {
       args.edit = true;
+      continue;
+    }
+
+    if (arg === "--undo") {
+      args.undo = true;
+      continue;
+    }
+
+    if (arg === "--log" || arg === "--last-log") {
+      args.log = true;
       continue;
     }
 
@@ -142,8 +166,9 @@ function parseArgs(argv, packageInfo) {
     args.path = arg;
   }
 
-  if (args.init && args.edit) {
-    throw new Error("Choose only one mode: --init or --edit.");
+  const modes = [args.init, args.edit, args.undo, args.log].filter(Boolean).length;
+  if (modes > 1) {
+    throw new Error("Choose only one mode: --init, --edit, --undo, or --log.");
   }
 
   return args;
@@ -325,6 +350,12 @@ async function runEdit(args, logger) {
     process.stderr.write(`${index + 1}. ${describeCall(call)}\n`);
   }
 
+  if (args.dryRun) {
+    process.stderr.write(`Dry run complete; no files changed.\nLog: ${logPath()}\n`);
+    await logger("EDIT dry-run complete");
+    return;
+  }
+
   if (!args.yes && process.stdin.isTTY) {
     const confirmed = await confirm("Apply these changes? [y/N] ");
     if (!confirmed) {
@@ -334,17 +365,237 @@ async function runEdit(args, logger) {
     }
   }
 
+  const history = await createHistoryEntry(calls);
+  await logger(`HISTORY saved ${history.path}`);
+
   for (const [index, call] of calls.entries()) {
     await logger(`TOOL ${index + 1}/${calls.length} ${JSON.stringify(redactLargeFields(call))}`);
-    if (args.dryRun) {
-      continue;
-    }
     await executeToolCall(call);
   }
 
-  const suffix = args.dryRun ? "Dry run complete; no files changed." : "Changes applied.";
-  process.stderr.write(`${suffix}\nLog: ${logPath()}\n`);
-  await logger(`EDIT complete dryRun=${args.dryRun}`);
+  process.stderr.write(`Changes applied.\nUndo with: pastepatch --undo\nLog: ${logPath()}\n`);
+  await logger("EDIT complete dryRun=false");
+}
+
+async function runUndo(logger) {
+  const entry = await readLatestUndoableHistoryEntry();
+
+  if (!entry) {
+    throw new Error("No pastepatch history entry to undo.");
+  }
+
+  for (const snapshot of entry.snapshots) {
+    await rm(safePath(snapshot.path), { recursive: true, force: true });
+  }
+
+  for (const snapshot of entry.snapshots) {
+    if (snapshot.type !== "missing") {
+      await restoreSnapshot(snapshot);
+    }
+  }
+
+  entry.undoneAt = new Date().toISOString();
+  await writeFile(entry.historyPath, JSON.stringify(stripHistoryPath(entry), null, 2), "utf8");
+  await logger(`UNDO ${entry.id}`);
+  process.stderr.write(
+    `Undid ${entry.calls.length} tool call${entry.calls.length === 1 ? "" : "s"} from ${entry.createdAt}.\nLog: ${logPath()}\n`,
+  );
+}
+
+async function runLog() {
+  try {
+    process.stdout.write(await readFile(logPath(), "utf8"));
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      process.stdout.write(`No pastepatch log found at ${logPath()}\n`);
+      return;
+    }
+    throw error;
+  }
+}
+
+async function createHistoryEntry(calls) {
+  const id = `${new Date().toISOString().replace(/[:.]/g, "-")}-${process.pid}`;
+  const historyDirectory = await historyDir();
+  const historyPath = path.join(historyDirectory, `${id}.json`);
+  const affectedPaths = [...new Set(calls.flatMap(affectedPathsForCall))];
+  const snapshots = [];
+
+  for (const relativePath of affectedPaths) {
+    snapshots.push(await snapshotPath(relativePath));
+  }
+
+  const entry = {
+    id,
+    version: 1,
+    createdAt: new Date().toISOString(),
+    cwd: process.cwd(),
+    calls: calls.map(redactLargeFields),
+    snapshots,
+  };
+
+  await mkdir(historyDirectory, { recursive: true });
+  await writeFile(historyPath, JSON.stringify(entry, null, 2), "utf8");
+  return { ...entry, path: historyPath };
+}
+
+function affectedPathsForCall(call) {
+  if (call.tool === "move_file") {
+    return [call.from, call.to].filter(Boolean).map(normalizeRelativePath);
+  }
+
+  if (call.path) {
+    return [normalizeRelativePath(call.path)];
+  }
+
+  return [];
+}
+
+async function snapshotPath(relativePath) {
+  const normalizedPath = normalizeRelativePath(relativePath);
+  const absolutePath = safePath(normalizedPath);
+
+  try {
+    const stats = await lstat(absolutePath);
+    if (stats.isDirectory()) {
+      return {
+        path: normalizedPath,
+        type: "directory",
+        entries: await snapshotDirectory(absolutePath, normalizedPath),
+      };
+    }
+
+    return {
+      path: normalizedPath,
+      type: "file",
+      content: (await readFile(absolutePath)).toString("base64"),
+    };
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return { path: normalizedPath, type: "missing" };
+    }
+    throw error;
+  }
+}
+
+async function snapshotDirectory(absoluteDirectory, relativeDirectory) {
+  const entries = [];
+  const directoryEntries = await readdir(absoluteDirectory, { withFileTypes: true });
+
+  for (const entry of directoryEntries) {
+    const relativePath = path.join(relativeDirectory, entry.name);
+    const absolutePath = path.join(absoluteDirectory, entry.name);
+
+    if (entry.isDirectory()) {
+      entries.push({
+        path: normalizeRelativePath(relativePath),
+        type: "directory",
+      });
+      entries.push(...(await snapshotDirectory(absolutePath, relativePath)));
+      continue;
+    }
+
+    entries.push({
+      path: normalizeRelativePath(relativePath),
+      type: "file",
+      content: (await readFile(absolutePath)).toString("base64"),
+    });
+  }
+
+  return entries;
+}
+
+async function restoreSnapshot(snapshot) {
+  if (snapshot.type === "file") {
+    const target = safePath(snapshot.path);
+    await mkdir(path.dirname(target), { recursive: true });
+    await writeFile(target, Buffer.from(snapshot.content, "base64"));
+    return;
+  }
+
+  if (snapshot.type === "directory") {
+    await mkdir(safePath(snapshot.path), { recursive: true });
+    for (const entry of snapshot.entries) {
+      if (entry.type === "directory") {
+        await mkdir(safePath(entry.path), { recursive: true });
+        continue;
+      }
+
+      const target = safePath(entry.path);
+      await mkdir(path.dirname(target), { recursive: true });
+      await writeFile(target, Buffer.from(entry.content, "base64"));
+    }
+  }
+}
+
+async function readLatestUndoableHistoryEntry() {
+  const directory = await historyDir();
+
+  let files;
+  try {
+    files = await readdir(directory);
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
+
+  const historyFiles = files.filter((file) => file.endsWith(".json")).sort().reverse();
+
+  for (const file of historyFiles) {
+    const historyPath = path.join(directory, file);
+    const entry = JSON.parse(await readFile(historyPath, "utf8"));
+    if (!entry.undoneAt) {
+      return { ...entry, historyPath };
+    }
+  }
+
+  return null;
+}
+
+function stripHistoryPath(entry) {
+  const { historyPath, ...rest } = entry;
+  return rest;
+}
+
+async function historyDir() {
+  const gitDirectory = await findGitDirectory(process.cwd());
+  if (gitDirectory) {
+    return path.join(gitDirectory, "pastepatch", "history");
+  }
+
+  return path.join(process.cwd(), ".pastepatch", "history");
+}
+
+async function findGitDirectory(startDirectory) {
+  let directory = startDirectory;
+
+  for (;;) {
+    const dotGit = path.join(directory, ".git");
+    try {
+      const stats = await lstat(dotGit);
+      if (stats.isDirectory()) {
+        return dotGit;
+      }
+
+      const gitFile = await readFile(dotGit, "utf8");
+      const match = gitFile.match(/^gitdir: (.+)$/m);
+      if (match) {
+        return path.resolve(directory, match[1].trim());
+      }
+    } catch (error) {
+      if (error.code !== "ENOENT") {
+        throw error;
+      }
+    }
+
+    const parent = path.dirname(directory);
+    if (parent === directory) {
+      return null;
+    }
+    directory = parent;
+  }
 }
 
 async function readToolPlanInput() {
@@ -568,6 +819,11 @@ function safePath(relativePath) {
   return path.resolve(process.cwd(), normalized);
 }
 
+function normalizeRelativePath(relativePath) {
+  safePath(relativePath);
+  return path.normalize(relativePath);
+}
+
 function requireString(value, field, tool) {
   if (typeof value !== "string") {
     throw new Error(`${tool} requires a string "${field}" field.`);
@@ -711,6 +967,8 @@ ${description ? `\n${description}\n` : ""}
 Usage:
   ${command} --init [path] [options] [-- ingest-options]
   ${command} --edit [options]
+  ${command} --undo
+  ${command} --log
 
 Examples:
   ${command} --init
@@ -719,12 +977,16 @@ Examples:
   ${command} --edit
   ${command} --edit --dry-run < chatgpt-tools.json
   ${command} --edit --yes < chatgpt-tools.json
+  ${command} --undo
+  ${command} --log
   ${command} --help
   ${command} --version
 
 Options:
   --init                           Generate the initial ChatGPT coding prompt with a codebase digest.
   --edit                           Apply the ChatGPT JSON tool plan currently on the clipboard.
+  --undo                           Undo the most recent applied pastepatch change set.
+  --log, --last-log                Print the pastepatch log for the current directory.
   --path <path>                    Project path for --init. A positional path also works. Default: current directory.
   -m, --message, --task <text>      First-turn instructions to include in the --init prompt instead of asking interactively.
   -i, --include <pattern>          Forward an include pattern to @nocdn/ingest. Repeatable.
@@ -740,6 +1002,7 @@ Notes:
   --init runs: bunx @nocdn/ingest <path> --stdout
   Anything after -- is forwarded directly to @nocdn/ingest.
   --edit reads from the clipboard when run interactively, or from stdin when piped.
+  --edit stores undo history under .git/pastepatch/history when run inside a git repository.
   --edit writes details and errors to .pastepatch.log in the current directory.
 `;
 }
