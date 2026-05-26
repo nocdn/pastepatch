@@ -1,11 +1,11 @@
 {
-  "name": "@nocdn/chat-coding",
+  "name": "@nocdn/pastepatch",
   "version": "0.0.1",
-  "description": "A cli script where I can paste changes that an agent is requesting, and have them be executed",
+  "description": "A CLI for coding with ChatGPT by generating codebase prompts and applying JSON tool plans",
   "license": "MIT",
   "type": "module",
   "bin": {
-    "chat-coding": "bin/cli.js"
+    "pastepatch": "bin/cli.js"
   },
   "files": [
     "bin",

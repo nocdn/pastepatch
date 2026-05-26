@@ -1,8 +1,20 @@
 #!/usr/bin/env node
-import { readFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { createInterface } from "node:readline/promises";
+import {
+  appendFile,
+  mkdir,
+  readFile,
+  rename,
+  rm,
+  writeFile,
+} from "node:fs/promises";
+import path from "node:path";
+import process from "node:process";
 
 async function main() {
   const packageInfo = await readPackageInfo();
+  const logger = createLogger();
 
   try {
     const args = parseArgs(process.argv.slice(2), packageInfo);
@@ -17,9 +29,21 @@ async function main() {
       return;
     }
 
-    console.log("Hello World!");
+    if (args.init) {
+      await runInit(args, packageInfo, logger);
+      return;
+    }
+
+    if (args.edit) {
+      await runEdit(args, logger);
+      return;
+    }
+
+    throw new Error(`Choose --init or --edit. Run ${packageInfo.name} --help for usage.`);
   } catch (error) {
+    await logger(`ERROR ${error.stack || error.message}`);
     process.stderr.write(`Error: ${error.message}\n`);
+    process.stderr.write(`Log: ${logPath()}\n`);
     process.exitCode = 1;
   }
 }
@@ -28,6 +52,17 @@ function parseArgs(argv, packageInfo) {
   const args = {
     help: false,
     version: false,
+    init: false,
+    edit: false,
+    path: ".",
+    stdout: false,
+    noClipboard: false,
+    dryRun: false,
+    yes: false,
+    task: "",
+    include: [],
+    exclude: [],
+    ingestArgs: [],
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -43,14 +78,623 @@ function parseArgs(argv, packageInfo) {
       continue;
     }
 
+    if (arg === "--init") {
+      args.init = true;
+      continue;
+    }
+
+    if (arg === "--edit") {
+      args.edit = true;
+      continue;
+    }
+
+    if (arg === "--stdout") {
+      args.stdout = true;
+      continue;
+    }
+
+    if (arg === "--no-clipboard") {
+      args.noClipboard = true;
+      continue;
+    }
+
+    if (arg === "--dry-run") {
+      args.dryRun = true;
+      continue;
+    }
+
+    if (arg === "-y" || arg === "--yes") {
+      args.yes = true;
+      continue;
+    }
+
+    if (arg === "--path") {
+      args.path = readOptionValue(argv, (index += 1), arg);
+      continue;
+    }
+
+    if (arg === "-m" || arg === "--message" || arg === "--task") {
+      args.task = readOptionValue(argv, (index += 1), arg);
+      continue;
+    }
+
+    if (arg === "-i" || arg === "--include") {
+      args.include.push(readOptionValue(argv, (index += 1), arg));
+      continue;
+    }
+
+    if (arg === "-e" || arg === "--exclude") {
+      args.exclude.push(readOptionValue(argv, (index += 1), arg));
+      continue;
+    }
+
+    if (arg === "--") {
+      args.ingestArgs.push(...argv.slice(index + 1));
+      break;
+    }
+
     if (arg.startsWith("-")) {
       throw new Error(
         `Unknown option "${arg}". Run ${packageInfo.name} --help for usage.`,
       );
     }
+
+    args.path = arg;
+  }
+
+  if (args.init && args.edit) {
+    throw new Error("Choose only one mode: --init or --edit.");
   }
 
   return args;
+}
+
+function readOptionValue(argv, index, flag) {
+  const value = argv[index];
+  if (!value || value.startsWith("-")) {
+    throw new Error(`${flag} requires a value.`);
+  }
+  return value;
+}
+
+async function runInit(args, packageInfo, logger) {
+  const root = path.resolve(args.path);
+  await logger(`INIT root=${root}`);
+
+  const task = args.task || (await readInitialTask());
+  await logger(`INIT taskBytes=${Buffer.byteLength(task)}`);
+
+  const digest = await runIngest(root, args, logger);
+  const prompt = buildPrompt(packageInfo, root, digest, task);
+
+  if (args.stdout || args.noClipboard) {
+    process.stdout.write(prompt);
+    if (!prompt.endsWith("\n")) {
+      process.stdout.write("\n");
+    }
+  }
+
+  if (!args.noClipboard) {
+    await copyToClipboard(prompt, logger);
+    process.stderr.write("ChatGPT coding prompt copied to clipboard. Paste it into ChatGPT.\n");
+  }
+
+  await logger(`INIT complete promptBytes=${Buffer.byteLength(prompt)}`);
+}
+
+async function readInitialTask() {
+  if (!process.stdin.isTTY) {
+    return "";
+  }
+
+  process.stderr.write(
+    "What do you want ChatGPT to implement in the first turn? Paste/type instructions, then press Enter on an empty line.\n",
+  );
+
+  const rl = createInterface({ input: process.stdin, output: process.stderr });
+  const lines = [];
+
+  try {
+    for (;;) {
+      const line = await rl.question("");
+      if (line === "") {
+        break;
+      }
+      lines.push(line);
+    }
+  } catch (error) {
+    if (error.code !== "ERR_USE_AFTER_CLOSE") {
+      throw error;
+    }
+  } finally {
+    rl.close();
+  }
+
+  return lines.join("\n").trim();
+}
+
+async function runIngest(root, args, logger) {
+  const ingestArgs = ["@nocdn/ingest", root, "--stdout"];
+
+  for (const pattern of args.include) {
+    ingestArgs.push("--include", pattern);
+  }
+
+  for (const pattern of args.exclude) {
+    ingestArgs.push("--exclude", pattern);
+  }
+
+  ingestArgs.push(...args.ingestArgs);
+  await logger(`INGEST bunx ${ingestArgs.map(shellQuote).join(" ")}`);
+
+  try {
+    return await runCommand("bunx", ingestArgs, { cwd: root });
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      throw error;
+    }
+    await logger("INGEST bunx not found; falling back to npx -y @nocdn/ingest");
+    return await runCommand("npx", ["-y", ...ingestArgs], { cwd: root });
+  }
+}
+
+function buildPrompt(packageInfo, root, digest, task) {
+  return `You are helping me code in ChatGPT, but you do not have live filesystem tools.
+
+The codebase digest below is the current source of truth for this project at:
+${root}
+
+My requested change for your first response is:
+
+${task || "No specific first-turn task was provided. Ask me what to change before producing a tool plan."}
+
+We will keep using this same ChatGPT conversation for follow-up coding tasks. After you output a tool plan, I will apply it locally with the CLI and then report whether it succeeded. For follow-ups, use the original digest plus the tool plans that were applied as your working model of the repo. If uncertain, ask me to regenerate and paste a fresh --init digest.
+
+When you propose code changes, output ONLY a JSON tool plan in one fenced code block. Do not include prose outside the code block.
+
+The JSON must be either an array of tool calls or an object with a "tools" array. Each tool call must be an object with a "tool" field.
+
+Available tools that my local ${packageInfo.name} CLI can execute:
+
+1. create_file
+   Creates or overwrites a UTF-8 text file.
+   Required fields: "path", "content"
+
+2. replace_in_file
+   Replaces text inside a UTF-8 text file. Prefer this for edits to existing files.
+   Required fields: "path", "old", "new"
+   Optional fields: "replaceAll" (boolean, default false)
+   Rules: "old" must be an exact string from the digest. If replaceAll is false, "old" must occur exactly once.
+
+3. delete_file
+   Deletes a file or empty/non-empty directory.
+   Required fields: "path"
+
+4. move_file
+   Renames or moves a file/directory.
+   Required fields: "from", "to"
+
+5. append_to_file
+   Appends UTF-8 text to a file, creating parent directories if needed.
+   Required fields: "path", "content"
+
+Example output:
+
+\`\`\`json
+[
+  {
+    "tool": "replace_in_file",
+    "path": "README.md",
+    "old": "old exact text",
+    "new": "new exact text"
+  },
+  {
+    "tool": "create_file",
+    "path": "src/example.js",
+    "content": "export const ok = true;\\n"
+  }
+]
+\`\`\`
+
+Important instructions:
+- Use relative paths only.
+- Never use paths containing ".." or absolute paths.
+- Keep edits small and targeted.
+- If you need to change an existing file, use replace_in_file with a large enough exact old string to be unique.
+- Do not invent read/list/shell tools. You only have the tools above.
+- Do not output Markdown explanations when returning the final tool plan; output only the JSON fenced code block.
+
+CODEBASE DIGEST START
+
+${digest}
+
+CODEBASE DIGEST END
+`;
+}
+
+async function runEdit(args, logger) {
+  const input = await readToolPlanInput();
+  const calls = parseToolCalls(input);
+
+  if (calls.length === 0) {
+    throw new Error("No tool calls found in pasted input.");
+  }
+
+  process.stderr.write(`Parsed ${calls.length} tool call${calls.length === 1 ? "" : "s"}.\n`);
+  for (const [index, call] of calls.entries()) {
+    process.stderr.write(`${index + 1}. ${describeCall(call)}\n`);
+  }
+
+  if (!args.yes && process.stdin.isTTY) {
+    const confirmed = await confirm("Apply these changes? [y/N] ");
+    if (!confirmed) {
+      process.stderr.write("Aborted.\n");
+      await logger("EDIT aborted by user");
+      return;
+    }
+  }
+
+  for (const [index, call] of calls.entries()) {
+    await logger(`TOOL ${index + 1}/${calls.length} ${JSON.stringify(redactLargeFields(call))}`);
+    if (args.dryRun) {
+      continue;
+    }
+    await executeToolCall(call);
+  }
+
+  const suffix = args.dryRun ? "Dry run complete; no files changed." : "Changes applied.";
+  process.stderr.write(`${suffix}\nLog: ${logPath()}\n`);
+  await logger(`EDIT complete dryRun=${args.dryRun}`);
+}
+
+async function readToolPlanInput() {
+  if (!process.stdin.isTTY) {
+    return await readStream(process.stdin);
+  }
+
+  process.stderr.write("Reading ChatGPT JSON tool plan from clipboard...\n");
+  const input = await readClipboard();
+
+  if (!input.trim()) {
+    throw new Error("Clipboard is empty. Copy ChatGPT's JSON tool plan, then run --edit again.");
+  }
+
+  return input;
+}
+
+async function readClipboard() {
+  const commands = clipboardReadCommands();
+  const errors = [];
+
+  for (const [command, args] of commands) {
+    try {
+      return await runCommand(command, args);
+    } catch (error) {
+      errors.push(`${command}: ${error.message}`);
+    }
+  }
+
+  throw new Error(
+    `Could not read from the system clipboard. You can still pipe input with: pbpaste | pastepatch --edit. ${errors.join(" ")}`,
+  );
+}
+
+function clipboardReadCommands() {
+  if (process.platform === "darwin") {
+    return [["pbpaste", []]];
+  }
+
+  if (process.platform === "win32") {
+    return [["powershell.exe", ["-NoProfile", "-Command", "Get-Clipboard"]]];
+  }
+
+  return [
+    ["wl-paste", []],
+    ["xclip", ["-selection", "clipboard", "-o"]],
+    ["xsel", ["--clipboard", "--output"]],
+  ];
+}
+
+function parseToolCalls(input) {
+  const candidates = extractJsonCandidates(input);
+  const errors = [];
+
+  for (const candidate of candidates) {
+    try {
+      return normalizeToolPlan(JSON.parse(candidate));
+    } catch (error) {
+      errors.push(error.message);
+    }
+  }
+
+  throw new Error(
+    `Clipboard/input does not contain a valid JSON tool plan. Copy ChatGPT's fenced json code block using the code block copy button, then run --edit again. ${errors.join(" ")}`.trim(),
+  );
+}
+
+function extractJsonCandidates(input) {
+  const candidates = [];
+  const fencePattern = /```(?:json|javascript|js)?\s*([\s\S]*?)```/gi;
+  let match;
+
+  while ((match = fencePattern.exec(input)) !== null) {
+    candidates.push(match[1].trim());
+  }
+
+  const trimmed = input.trim();
+  if (trimmed) {
+    candidates.push(trimmed);
+  }
+
+  const firstArray = trimmed.indexOf("[");
+  const lastArray = trimmed.lastIndexOf("]");
+  if (firstArray !== -1 && lastArray > firstArray) {
+    candidates.push(trimmed.slice(firstArray, lastArray + 1));
+  }
+
+  const firstObject = trimmed.indexOf("{");
+  const lastObject = trimmed.lastIndexOf("}");
+  if (firstObject !== -1 && lastObject > firstObject) {
+    candidates.push(trimmed.slice(firstObject, lastObject + 1));
+  }
+
+  return [...new Set(candidates)];
+}
+
+function normalizeToolPlan(plan) {
+  const rawCalls = Array.isArray(plan) ? plan : plan.tools || plan.tool_calls || plan.calls;
+
+  if (!Array.isArray(rawCalls)) {
+    throw new Error("Tool plan must be an array or an object with a tools array.");
+  }
+
+  return rawCalls.map((call) => {
+    if (!call || typeof call !== "object") {
+      throw new Error("Each tool call must be an object.");
+    }
+
+    const tool = call.tool || call.name;
+    const args = normalizeCallArguments(call);
+
+    if (!tool || typeof tool !== "string") {
+      throw new Error("Each tool call needs a string tool field.");
+    }
+
+    return { ...args, tool };
+  });
+}
+
+function normalizeCallArguments(call) {
+  if (!Object.prototype.hasOwnProperty.call(call, "arguments")) {
+    return call;
+  }
+
+  if (typeof call.arguments === "string") {
+    return JSON.parse(call.arguments);
+  }
+
+  if (call.arguments && typeof call.arguments === "object") {
+    return call.arguments;
+  }
+
+  throw new Error("Tool call arguments must be an object or JSON object string.");
+}
+
+async function executeToolCall(call) {
+  switch (call.tool) {
+    case "create_file":
+      requireString(call.path, "path", call.tool);
+      requireString(call.content, "content", call.tool);
+      await writeTextFile(call.path, call.content);
+      return;
+
+    case "append_to_file":
+      requireString(call.path, "path", call.tool);
+      requireString(call.content, "content", call.tool);
+      await appendTextFile(call.path, call.content);
+      return;
+
+    case "replace_in_file":
+    case "amend_file":
+    case "amend":
+      requireString(call.path, "path", call.tool);
+      requireString(call.old, "old", call.tool);
+      requireString(call.new, "new", call.tool);
+      await replaceInFile(call.path, call.old, call.new, Boolean(call.replaceAll));
+      return;
+
+    case "delete_file":
+      requireString(call.path, "path", call.tool);
+      await rm(safePath(call.path), { recursive: true, force: true });
+      return;
+
+    case "move_file":
+      requireString(call.from, "from", call.tool);
+      requireString(call.to, "to", call.tool);
+      await mkdir(path.dirname(safePath(call.to)), { recursive: true });
+      await rename(safePath(call.from), safePath(call.to));
+      return;
+
+    default:
+      throw new Error(`Unknown tool "${call.tool}".`);
+  }
+}
+
+async function writeTextFile(relativePath, content) {
+  const target = safePath(relativePath);
+  await mkdir(path.dirname(target), { recursive: true });
+  await writeFile(target, content, "utf8");
+}
+
+async function appendTextFile(relativePath, content) {
+  const target = safePath(relativePath);
+  await mkdir(path.dirname(target), { recursive: true });
+  await appendFile(target, content, "utf8");
+}
+
+async function replaceInFile(relativePath, oldText, newText, replaceAll) {
+  const target = safePath(relativePath);
+  const current = await readFile(target, "utf8");
+  const count = countOccurrences(current, oldText);
+
+  if (count === 0) {
+    throw new Error(`${relativePath}: old string was not found.`);
+  }
+
+  if (!replaceAll && count !== 1) {
+    throw new Error(
+      `${relativePath}: old string occurs ${count} times. Use a more specific old string or set replaceAll true.`,
+    );
+  }
+
+  const updated = replaceAll ? current.split(oldText).join(newText) : current.replace(oldText, newText);
+  await writeFile(target, updated, "utf8");
+}
+
+function safePath(relativePath) {
+  if (typeof relativePath !== "string" || relativePath.length === 0) {
+    throw new Error("Path must be a non-empty string.");
+  }
+
+  if (path.isAbsolute(relativePath)) {
+    throw new Error(`Refusing absolute path: ${relativePath}`);
+  }
+
+  const normalized = path.normalize(relativePath);
+  if (normalized === ".." || normalized.startsWith(`..${path.sep}`)) {
+    throw new Error(`Refusing path outside the current directory: ${relativePath}`);
+  }
+
+  return path.resolve(process.cwd(), normalized);
+}
+
+function requireString(value, field, tool) {
+  if (typeof value !== "string") {
+    throw new Error(`${tool} requires a string "${field}" field.`);
+  }
+}
+
+function countOccurrences(haystack, needle) {
+  if (needle === "") {
+    throw new Error("old string must not be empty.");
+  }
+
+  let count = 0;
+  let index = 0;
+
+  for (;;) {
+    index = haystack.indexOf(needle, index);
+    if (index === -1) {
+      return count;
+    }
+    count += 1;
+    index += needle.length;
+  }
+}
+
+function describeCall(call) {
+  if (call.tool === "move_file") {
+    return `${call.tool}: ${call.from} -> ${call.to}`;
+  }
+  return `${call.tool}: ${call.path || "(no path)"}`;
+}
+
+function redactLargeFields(call) {
+  const copy = { ...call };
+  for (const field of ["content", "old", "new"]) {
+    if (typeof copy[field] === "string") {
+      copy[field] = `<${Buffer.byteLength(copy[field])} bytes>`;
+    }
+  }
+  return copy;
+}
+
+async function confirm(message) {
+  const rl = createInterface({ input: process.stdin, output: process.stderr });
+  try {
+    const answer = await rl.question(message);
+    return answer.trim().toLowerCase() === "y" || answer.trim().toLowerCase() === "yes";
+  } finally {
+    rl.close();
+  }
+}
+
+async function copyToClipboard(text, logger) {
+  const command = process.platform === "darwin" ? "pbcopy" : process.platform === "win32" ? "clip" : "xclip";
+  const args = process.platform === "linux" ? ["-selection", "clipboard"] : [];
+
+  try {
+    await runCommand(command, args, { input: text });
+  } catch (error) {
+    await logger(`CLIPBOARD failed command=${command} error=${error.message}`);
+    process.stdout.write(text);
+    if (!text.endsWith("\n")) {
+      process.stdout.write("\n");
+    }
+    process.stderr.write("Could not copy to clipboard, so the prompt was printed to stdout instead.\n");
+  }
+}
+
+function runCommand(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd: options.cwd || process.cwd(),
+      stdio: [options.input ? "pipe" : "ignore", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolve(stdout);
+        return;
+      }
+      const error = new Error(`${command} exited with code ${code}: ${stderr.trim()}`);
+      error.code = code;
+      reject(error);
+    });
+
+    if (options.input) {
+      child.stdin.end(options.input);
+    }
+  });
+}
+
+function readStream(stream) {
+  return new Promise((resolve, reject) => {
+    let value = "";
+    stream.setEncoding("utf8");
+    stream.on("data", (chunk) => {
+      value += chunk;
+    });
+    stream.on("error", reject);
+    stream.on("end", () => resolve(value));
+  });
+}
+
+function createLogger() {
+  return async (message) => {
+    await mkdir(path.dirname(logPath()), { recursive: true });
+    await appendFile(logPath(), `[${new Date().toISOString()}] ${message}\n`, "utf8");
+  };
+}
+
+function logPath() {
+  return path.join(process.cwd(), ".pastepatch.log");
+}
+
+function shellQuote(value) {
+  return /[^A-Za-z0-9_/:=.,@+-]/.test(value) ? JSON.stringify(value) : value;
 }
 
 async function readPackageInfo() {
@@ -65,16 +709,38 @@ function helpText(packageInfo) {
   return `${command} ${packageInfo.version}
 ${description ? `\n${description}\n` : ""}
 Usage:
-  ${command} [options]
+  ${command} --init [path] [options] [-- ingest-options]
+  ${command} --edit [options]
 
 Examples:
-  ${command}
+  ${command} --init
+  ${command} --init ../my-app --exclude node_modules -- --line-numbers
+  ${command} --init --stdout > chatgpt-prompt.txt
+  ${command} --edit
+  ${command} --edit --dry-run < chatgpt-tools.json
+  ${command} --edit --yes < chatgpt-tools.json
   ${command} --help
   ${command} --version
 
 Options:
+  --init                           Generate the initial ChatGPT coding prompt with a codebase digest.
+  --edit                           Apply the ChatGPT JSON tool plan currently on the clipboard.
+  --path <path>                    Project path for --init. A positional path also works. Default: current directory.
+  -m, --message, --task <text>      First-turn instructions to include in the --init prompt instead of asking interactively.
+  -i, --include <pattern>          Forward an include pattern to @nocdn/ingest. Repeatable.
+  -e, --exclude <pattern>          Forward an exclude pattern to @nocdn/ingest. Repeatable.
+  --stdout                         Print the --init prompt to stdout. Also copies it unless --no-clipboard is set.
+  --no-clipboard                   Do not copy the --init prompt; print it to stdout instead.
+  --dry-run                        Parse and preview --edit tool calls without changing files.
+  -y, --yes                        Apply --edit tool calls without prompting.
   -h, --help                       Show this help text.
   -v, --version                    Show the package version.
+
+Notes:
+  --init runs: bunx @nocdn/ingest <path> --stdout
+  Anything after -- is forwarded directly to @nocdn/ingest.
+  --edit reads from the clipboard when run interactively, or from stdin when piped.
+  --edit writes details and errors to .pastepatch.log in the current directory.
 `;
 }
 

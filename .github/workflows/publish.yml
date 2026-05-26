@@ -1,12 +1,12 @@
 name: Publish to npm
 
-# Run on every push. Publishing is skipped automatically if the
-# version in package.json is already on the npm registry, so a normal
-# code push does not fail the workflow.
+# Run on the default branch and manual dispatch. Publishing is skipped
+# automatically if the version in package.json is already on the npm
+# registry, so a normal code push does not fail the workflow.
 on:
   push:
     branches:
-      - "**"
+      - main
   workflow_dispatch:
 
 # Trusted publishing requires `id-token: write` so GitHub Actions can mint
@@ -39,6 +39,7 @@ jobs:
           # `npm install -g npm@latest` on Node 22.22.2.
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
 
       # Belt-and-braces upgrade in case the bundled npm is older than 11.5.1.
       # `-f` avoids the self-update bug seen on some Node 22 images.
@@ -48,6 +49,9 @@ jobs:
       - name: Install dependencies
         run: npm install --no-audit --no-fund
 
+      - name: Run tests
+        run: npm test --if-present
+
       # Compare the local package.json version to whatever is currently on
       # npm. If they match there is nothing to publish, so skip cleanly.
       - name: Check whether the current version is already published
@@ -55,13 +59,8 @@ jobs:
         run: |
           NAME=$(node -p "require('./package.json').name")
           VERSION=$(node -p "require('./package.json').version")
-          PUBLISH_FLAGS="--provenance"
-          if [[ "$NAME" == @*/* ]]; then
-            PUBLISH_FLAGS="$PUBLISH_FLAGS --access public"
-          fi
           echo "name=$NAME"       >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "publish_flags=$PUBLISH_FLAGS" >> "$GITHUB_OUTPUT"
           if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
             echo "published=true" >> "$GITHUB_OUTPUT"
             echo "::notice::$NAME@$VERSION is already on npm; skipping publish."
@@ -72,9 +71,9 @@ jobs:
 
       # The npm CLI auto-detects the OIDC environment via id-token: write
       # and exchanges it for a short-lived publish token, so no NODE_AUTH_TOKEN
-      # is needed. package.json sets publishConfig.access=public so scoped
-      # packages publish publicly by default; --access public is also passed
-      # for scoped packages to keep the workflow explicit.
+      # is needed. --provenance is set explicitly even though it is the
+      # default for trusted publishing on public repos, to surface failures
+      # early if attestation cannot be generated.
       - name: Publish to npm with trusted publishing
         if: steps.check.outputs.published == 'false'
-        run: npm publish ${{ steps.check.outputs.publish_flags }}
+        run: npm publish --provenance --access public
