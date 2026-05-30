@@ -41,7 +41,7 @@ pastepatch --log
 | `-e`, `--exclude <pattern>` | forward an exclude pattern to `@nocdn/ingest`; repeatable |
 | `--stdout` | print the `--init` prompt to stdout; still copies to clipboard unless `--no-clipboard` is set |
 | `--no-clipboard` | do not copy the `--init` prompt; print it to stdout instead |
-| `--dry-run` | parse and preview `--edit` tool calls without changing files |
+| `--dry-run` | validate and preview `--edit` tool calls without changing files |
 | `-y`, `--yes` | apply `--edit` tool calls without prompting |
 | `-h`, `--help` | show help |
 | `-v`, `--version` | show version |
@@ -148,14 +148,16 @@ Supported tools:
 | `create_file` | `path`, `content` | create or overwrite a UTF-8 text file |
 | `replace_in_file` | `path`, `old`, `new` | replace an exact string in a UTF-8 text file |
 | `append_to_file` | `path`, `content` | append UTF-8 text to a file |
-| `delete_file` | `path` | delete a file or directory |
+| `delete_file` | `path` | delete an existing file or directory |
 | `move_file` | `from`, `to` | rename or move a file or directory |
 
 `replace_in_file` replaces one occurrence by default. If `old` appears more
 than once, the CLI stops with an error unless the call sets
 `"replaceAll": true`.
 
-For safety, paths must be relative and must not escape the current directory.
+For safety, paths must be relative, must not be `.`, must not contain `..`,
+and must not escape the current directory. Tool calls do not operate on
+symbolic links. `delete_file` fails when the target path does not exist.
 Details and errors are written to `.pastepatch.log` in the current directory.
 Undo history for applied edits is written under `.git/pastepatch/history` when
 inside a git repository, or `.pastepatch/history` outside git repositories.
@@ -165,6 +167,7 @@ inside a git repository, or `.pastepatch/history` outside git repositories.
 ```bash
 npm install
 npm start
+npm test
 ```
 
 The CLI entry point lives in [`bin/cli.js`](./bin/cli.js). The package is built
