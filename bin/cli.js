@@ -276,7 +276,9 @@ ${task || "No specific first-turn task was provided. Ask me what to change befor
 
 We will keep using this same ChatGPT conversation for follow-up coding tasks. After you output a tool plan, I will apply it locally with the CLI and then report whether it succeeded. For follow-ups, use the original digest plus the tool plans that were applied as your working model of the repo. If uncertain, ask me to regenerate and paste a fresh --init digest.
 
-When you propose code changes, put the JSON tool plan first, in one fenced json code block. If you want to say anything else—what changed, which files changed, disclaimers, answers to my questions, testing notes, or any other explanation—put that prose after the code block, outside the code block. Never put prose before the JSON code block.
+When you propose code changes, put the JSON tool plan first, in one fenced json code block. Never put prose before the JSON code block.
+
+After the JSON code block, you are encouraged to write freely. Treat this as a collaborative coding conversation: summarize what changed and why, list the files you touched, flag anything you were unsure about, ask me clarifying questions, suggest follow-ups, call out tests I should run, note assumptions you made, or raise anything else worth my attention. (By the way, that list was a list of suggestions, you don't have to do them every time, just when you think it's useful) Do not stay silent after the code block - the prose afterward is how we collaborate between turns.
 
 The JSON must be either an array of tool calls or an object with a "tools" array. Each tool call must be an object with a "tool" field.
 
@@ -323,6 +325,7 @@ Example output:
 \`\`\`
 
 Important instructions:
+- Before proposing changes, do thorough web research. Search the web liberally to confirm current, up-to-date API signatures, library versions, framework conventions, and best practices for whatever stack this project uses. Do not rely on stale training data when external APIs, SDKs, CLIs, or libraries are involved—verify against the latest official documentation. It is far better to over-research than to ship a tool plan based on outdated assumptions.
 - Use relative paths only.
 - Never use "." as a path.
 - Never use paths containing ".." or absolute paths.
