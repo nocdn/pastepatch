@@ -251,9 +251,15 @@ async function runIngest(root, args, logger) {
   }
 
   ingestArgs.push(...args.ingestArgs);
+
   await logger(`INGEST bunx ${ingestArgs.map(shellQuote).join(" ")}`);
 
   try {
+    if (process.platform === "win32" && !(await windowsCommandExists("bunx"))) {
+      const error = new Error("bunx was not found on PATH.");
+      error.code = "ENOENT";
+      throw error;
+    }
     return await runCommand("bunx", ingestArgs, { cwd: root });
   } catch (error) {
     if (error.code !== "ENOENT") {
@@ -656,7 +662,7 @@ async function readClipboard() {
   }
 
   throw new Error(
-    `Could not read from the system clipboard. You can still pipe input with: pbpaste | pastepatch --edit. ${errors.join(" ")}`,
+    `Could not read from the system clipboard. You can still pipe input with: ${clipboardPipeExample()}. ${errors.join(" ")}`,
   );
 }
 
@@ -666,7 +672,11 @@ function clipboardReadCommands() {
   }
 
   if (process.platform === "win32") {
-    return [["powershell.exe", ["-NoProfile", "-Command", "Get-Clipboard"]]];
+    const script = `${windowsPowerShellUtf8Setup()} Get-Clipboard -Raw`;
+    return [
+      ["powershell.exe", windowsPowerShellArgs(script)],
+      ["pwsh.exe", windowsPowerShellArgs(script)],
+    ];
   }
 
   return [
@@ -1201,26 +1211,76 @@ async function confirm(message) {
 }
 
 async function copyToClipboard(text, logger) {
-  const command = process.platform === "darwin" ? "pbcopy" : process.platform === "win32" ? "clip" : "xclip";
-  const args = process.platform === "linux" ? ["-selection", "clipboard"] : [];
+  const commands = clipboardWriteCommands();
+  const errors = [];
 
-  try {
-    await runCommand(command, args, { input: text });
-  } catch (error) {
-    await logger(`CLIPBOARD failed command=${command} error=${error.message}`);
-    process.stdout.write(text);
-    if (!text.endsWith("\n")) {
-      process.stdout.write("\n");
+  for (const [command, args] of commands) {
+    try {
+      await runCommand(command, args, { input: text });
+      return;
+    } catch (error) {
+      errors.push(`${command}: ${error.message}`);
+      await logger(`CLIPBOARD failed command=${command} error=${error.message}`);
     }
-    process.stderr.write("Could not copy to clipboard, so the prompt was printed to stdout instead.\n");
   }
+
+  process.stdout.write(text);
+  if (!text.endsWith("\n")) {
+    process.stdout.write("\n");
+  }
+  process.stderr.write(
+    `Could not copy to clipboard, so the prompt was printed to stdout instead. ${errors.join(" ")}\n`,
+  );
+}
+
+function clipboardWriteCommands() {
+  if (process.platform === "darwin") {
+    return [["pbcopy", []]];
+  }
+
+  if (process.platform === "win32") {
+    const script = `${windowsPowerShellUtf8Setup()} $text = [Console]::In.ReadToEnd(); Set-Clipboard -Value $text`;
+    return [
+      ["powershell.exe", windowsPowerShellArgs(script)],
+      ["pwsh.exe", windowsPowerShellArgs(script)],
+      ["clip.exe", []],
+    ];
+  }
+
+  return [["xclip", ["-selection", "clipboard"]]];
+}
+
+function clipboardPipeExample() {
+  if (process.platform === "darwin") {
+    return "pbpaste | pastepatch --edit";
+  }
+
+  if (process.platform === "win32") {
+    return "Get-Clipboard -Raw | pastepatch --edit";
+  }
+
+  return "wl-paste | pastepatch --edit";
+}
+
+function windowsPowerShellArgs(script) {
+  return ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script];
+}
+
+function windowsPowerShellUtf8Setup() {
+  return [
+    "[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false);",
+    "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false);",
+  ].join(" ");
 }
 
 function runCommand(command, args, options = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, {
+    const spawnConfig = commandSpawnConfig(command, args);
+    const child = spawn(spawnConfig.command, spawnConfig.args, {
       cwd: options.cwd || process.cwd(),
       stdio: [options.input ? "pipe" : "ignore", "pipe", "pipe"],
+      windowsHide: true,
+      ...spawnConfig.options,
     });
 
     let stdout = "";
@@ -1249,6 +1309,65 @@ function runCommand(command, args, options = {}) {
       child.stdin.end(options.input);
     }
   });
+}
+
+async function windowsCommandExists(command) {
+  try {
+    await runCommand("where.exe", [command]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function commandSpawnConfig(command, args) {
+  if (process.platform !== "win32" || isDirectlySpawnableWindowsCommand(command)) {
+    return { command, args, options: {} };
+  }
+
+  const commandLine = [command, ...args].map(quoteWindowsCmdArgument).join(" ");
+  return {
+    command: "cmd.exe",
+    args: ["/d", "/s", "/c", `"${commandLine}"`],
+    options: { windowsVerbatimArguments: true },
+  };
+}
+
+function isDirectlySpawnableWindowsCommand(command) {
+  const extension = path.extname(command).toLowerCase();
+  return extension === ".exe" || extension === ".com";
+}
+
+function quoteWindowsCmdArgument(value) {
+  const string = String(value);
+  if (string.length === 0) {
+    return "\"\"";
+  }
+
+  let quoted = "\"";
+  let backslashes = 0;
+
+  for (const character of string) {
+    if (character === "\\") {
+      backslashes += 1;
+      continue;
+    }
+
+    if (character === "\"") {
+      quoted += "\\".repeat(backslashes * 2 + 1);
+      quoted += character;
+      backslashes = 0;
+      continue;
+    }
+
+    quoted += "\\".repeat(backslashes);
+    backslashes = 0;
+    quoted += character;
+  }
+
+  quoted += "\\".repeat(backslashes * 2);
+  quoted += "\"";
+  return quoted;
 }
 
 function readStream(stream) {
@@ -1298,6 +1417,15 @@ function commandName(packageInfo) {
 function helpText(packageInfo) {
   const command = commandName(packageInfo);
   const description = packageInfo.description || "";
+  const editDryRunExample =
+    process.platform === "win32"
+      ? `Get-Content -Raw .\\chatgpt-tools.json | ${command} --edit --dry-run`
+      : `${command} --edit --dry-run < chatgpt-tools.json`;
+  const editYesExample =
+    process.platform === "win32"
+      ? `Get-Content -Raw .\\chatgpt-tools.json | ${command} --edit --yes`
+      : `${command} --edit --yes < chatgpt-tools.json`;
+
   return `${command} ${packageInfo.version}
 ${description ? `\n${description}\n` : ""}
 Usage:
@@ -1311,8 +1439,8 @@ Examples:
   ${command} --init ../my-app --exclude node_modules -- --line-numbers
   ${command} --init --stdout > chatgpt-prompt.txt
   ${command} --edit
-  ${command} --edit --dry-run < chatgpt-tools.json
-  ${command} --edit --yes < chatgpt-tools.json
+  ${editDryRunExample}
+  ${editYesExample}
   ${command} --undo
   ${command} --log
   ${command} --help
@@ -1335,9 +1463,9 @@ Options:
   -v, --version                    Show the package version.
 
 Notes:
-  --init runs: bunx @nocdn/ingest <path> --stdout
+  --init runs: bunx @nocdn/ingest <path> --stdout, falling back to npx -y if bunx is unavailable.
   Anything after -- is forwarded directly to @nocdn/ingest.
-  --edit reads from the clipboard when run interactively, or from stdin when piped.
+  --edit reads from the clipboard when run interactively, or from stdin when piped (${clipboardPipeExample()}).
   --edit stores undo history under .git/pastepatch/history when run inside a git repository.
   --edit writes details and errors to .pastepatch.log in the current directory.
 `;

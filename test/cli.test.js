@@ -52,6 +52,32 @@ test("paths containing parent directory segments are rejected", async () => {
   assert.match(result.stderr, /Refusing path containing "\.\."/);
 });
 
+test("windows-style relative paths are accepted", async () => {
+  const root = await tempProject();
+  const result = await runCli(["--edit", "--yes"], {
+    cwd: root,
+    input: JSON.stringify([{ tool: "create_file", path: "src\\nested\\created.txt", content: "hello\n" }]),
+  });
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(await readFile(path.join(root, "src", "nested", "created.txt"), "utf8"), "hello\n");
+});
+
+test("windows absolute paths are rejected", async () => {
+  const root = await tempProject();
+
+  await assertDryRunFails(
+    root,
+    [{ tool: "create_file", path: "C:\\temp\\created.txt", content: "x" }],
+    /Refusing absolute path/,
+  );
+  await assertDryRunFails(
+    root,
+    [{ tool: "create_file", path: "\\\\server\\share\\created.txt", content: "x" }],
+    /Refusing absolute path/,
+  );
+});
+
 test("writes through symlinked parents are rejected", async (t) => {
   const root = await tempProject();
 

@@ -12,6 +12,12 @@ Run without installing:
 npx @nocdn/pastepatch --init
 ```
 
+If you use Bun, `bunx` works too:
+
+```bash
+bunx @nocdn/pastepatch --init
+```
+
 Or install globally to use `pastepatch` directly from any repo:
 
 ```bash
@@ -31,7 +37,7 @@ pastepatch --log
 
 | flag | description |
 | --- | --- |
-| `--init` | ask what you want ChatGPT to implement, run `bunx @nocdn/ingest <path> --stdout`, wrap the task and digest with ChatGPT instructions, and copy the full prompt to the clipboard |
+| `--init` | ask what you want ChatGPT to implement, run `bunx @nocdn/ingest <path> --stdout` with an `npx -y` fallback, wrap the task and digest with ChatGPT instructions, and copy the full prompt to the clipboard |
 | `--edit` | read the ChatGPT JSON tool plan from the clipboard and apply the file edits |
 | `--undo` | undo the most recent applied pastepatch change set |
 | `--log`, `--last-log` | print the pastepatch log for the current directory |
@@ -127,8 +133,24 @@ For a non-interactive dry run:
 pbpaste | pastepatch --edit --dry-run
 ```
 
+In Windows PowerShell:
+
+```powershell
+Get-Clipboard -Raw | pastepatch --edit --dry-run
+```
+
+To read a saved tool plan file in PowerShell:
+
+```powershell
+Get-Content -Raw .\chatgpt-tools.json | pastepatch --edit --dry-run
+```
+
 `--edit` reads from the clipboard when run interactively, and from stdin when
 input is piped.
+
+On Windows, pastepatch invokes npm and Bun command shims through `cmd.exe`, so
+PowerShell users can run the CLI with either `npx` or `bunx`. Clipboard access
+uses PowerShell's `Get-Clipboard` and `Set-Clipboard` cmdlets when available.
 
 To inspect what happened in the current directory:
 
