@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import {
@@ -365,13 +366,34 @@ async function runEdit(args, logger) {
 
   await preflightToolCalls(calls, root);
 
+  const duplicatePlan = await findDuplicateAppliedPlan(calls, root);
+
   if (args.dryRun) {
+    if (duplicatePlan) {
+      writeDuplicatePlanNotice(duplicatePlan);
+    }
     process.stderr.write(`Dry run complete; no files changed.\nLog: ${logPath()}\n`);
     await logger("EDIT dry-run complete");
     return;
   }
 
-  if (!args.yes && process.stdin.isTTY) {
+  if (duplicatePlan) {
+    writeDuplicatePlanNotice(duplicatePlan);
+    await logger(`EDIT duplicate plan detected createdAt=${duplicatePlan.createdAt}`);
+
+    if (!process.stdin.isTTY) {
+      throw new Error(
+        "Refusing to re-apply a tool plan that matches the most recent apply in this directory. Copy a new ChatGPT JSON block, or run pastepatch --edit interactively and answer y to confirm.",
+      );
+    }
+
+    const confirmed = await confirm("Re-apply the same tool plan anyway? [y/N] ");
+    if (!confirmed) {
+      process.stderr.write("Aborted.\n");
+      await logger("EDIT aborted duplicate plan");
+      return;
+    }
+  } else if (!args.yes && process.stdin.isTTY) {
     const confirmed = await confirm("Apply these changes? [y/N] ");
     if (!confirmed) {
       process.stderr.write("Aborted.\n");
@@ -448,6 +470,7 @@ async function createHistoryEntry(calls, root = process.cwd()) {
     version: 1,
     createdAt: new Date().toISOString(),
     cwd: root,
+    callsDigest: toolPlanDigest(calls),
     calls: calls.map(redactLargeFields),
     snapshots,
   };
@@ -564,6 +587,33 @@ async function restoreSnapshot(snapshot, root = process.cwd()) {
   }
 }
 
+async function readLatestHistoryEntryForCwd(root = process.cwd()) {
+  const directory = await historyDir();
+  const resolvedRoot = path.resolve(root);
+
+  let files;
+  try {
+    files = await readdir(directory);
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
+
+  const historyFiles = files.filter((file) => file.endsWith(".json")).sort().reverse();
+
+  for (const file of historyFiles) {
+    const historyPath = path.join(directory, file);
+    const entry = JSON.parse(await readFile(historyPath, "utf8"));
+    if (path.resolve(entry.cwd || process.cwd()) === resolvedRoot) {
+      return { ...entry, historyPath };
+    }
+  }
+
+  return null;
+}
+
 async function readLatestUndoableHistoryEntry() {
   const directory = await historyDir();
 
@@ -588,6 +638,40 @@ async function readLatestUndoableHistoryEntry() {
   }
 
   return null;
+}
+
+async function findDuplicateAppliedPlan(calls, root = process.cwd()) {
+  const entry = await readLatestHistoryEntryForCwd(root);
+  if (!entry?.callsDigest || entry.callsDigest !== toolPlanDigest(calls)) {
+    return null;
+  }
+
+  return entry;
+}
+
+function toolPlanDigest(calls) {
+  return createHash("sha256").update(stableJsonStringify(calls)).digest("hex");
+}
+
+function stableJsonStringify(value) {
+  if (Array.isArray(value)) {
+    return `[${value.map(stableJsonStringify).join(",")}]`;
+  }
+
+  if (value && typeof value === "object") {
+    const keys = Object.keys(value).sort();
+    return `{${keys.map((key) => `${JSON.stringify(key)}:${stableJsonStringify(value[key])}`).join(",")}}`;
+  }
+
+  return JSON.stringify(value);
+}
+
+function writeDuplicatePlanNotice(entry) {
+  process.stderr.write(
+    `\nWarning: This tool plan matches the most recent pastepatch apply in this directory (${entry.createdAt}).\n` +
+      "You may have forgotten to copy a new ChatGPT JSON block from ChatGPT.\n" +
+      "Re-applying can fail (for example, replace_in_file) or repeat side effects (for example, append_to_file).\n",
+  );
 }
 
 function stripHistoryPath(entry) {
@@ -1458,7 +1542,7 @@ Options:
   --stdout                         Print the --init prompt to stdout. Also copies it unless --no-clipboard is set.
   --no-clipboard                   Do not copy the --init prompt; print it to stdout instead.
   --dry-run                        Validate and preview --edit tool calls without changing files.
-  -y, --yes                        Apply --edit tool calls without prompting.
+  -y, --yes                        Apply --edit tool calls without prompting (except when the plan matches the last apply).
   -h, --help                       Show this help text.
   -v, --version                    Show the package version.
 
@@ -1467,6 +1551,7 @@ Notes:
   Anything after -- is forwarded directly to @nocdn/ingest.
   --edit reads from the clipboard when run interactively, or from stdin when piped (${clipboardPipeExample()}).
   --edit stores undo history under .git/pastepatch/history when run inside a git repository.
+  --edit warns and requires confirmation when the pasted plan matches the most recent apply in the same directory.
   --edit writes details and errors to .pastepatch.log in the current directory.
 `;
 }

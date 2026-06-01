@@ -108,6 +108,49 @@ test("delete_file fails when the target is missing", async () => {
   assert.match(result.stderr, /path does not exist/);
 });
 
+test("duplicate tool plan is refused without interactive confirmation", async () => {
+  const root = await tempProject();
+  await mkdir(path.join(root, ".git"));
+  const plan = [{ tool: "create_file", path: "created.txt", content: "hello\n" }];
+
+  const first = await runCli(["--edit", "--yes"], {
+    cwd: root,
+    input: JSON.stringify(plan),
+  });
+  assert.equal(first.code, 0, first.stderr);
+
+  const second = await runCli(["--edit", "--yes"], {
+    cwd: root,
+    input: JSON.stringify(plan),
+  });
+
+  assert.equal(second.code, 1, second.stderr);
+  assert.match(second.stderr, /matches the most recent pastepatch apply/i);
+  assert.match(second.stderr, /Refusing to re-apply/i);
+  assert.equal(await readFile(path.join(root, "created.txt"), "utf8"), "hello\n");
+});
+
+test("dry run warns when tool plan matches the last apply", async () => {
+  const root = await tempProject();
+  await mkdir(path.join(root, ".git"));
+  const plan = [{ tool: "create_file", path: "created.txt", content: "hello\n" }];
+
+  const first = await runCli(["--edit", "--yes"], {
+    cwd: root,
+    input: JSON.stringify(plan),
+  });
+  assert.equal(first.code, 0, first.stderr);
+
+  const second = await runCli(["--edit", "--dry-run"], {
+    cwd: root,
+    input: JSON.stringify(plan),
+  });
+
+  assert.equal(second.code, 0, second.stderr);
+  assert.match(second.stderr, /matches the most recent pastepatch apply/i);
+  assert.match(second.stderr, /Dry run complete/i);
+});
+
 test("undo restores paths relative to the original edit directory", async () => {
   const root = await tempProject();
   await mkdir(path.join(root, ".git"));

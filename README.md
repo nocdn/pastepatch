@@ -48,7 +48,7 @@ pastepatch --log
 | `--stdout` | print the `--init` prompt to stdout; still copies to clipboard unless `--no-clipboard` is set |
 | `--no-clipboard` | do not copy the `--init` prompt; print it to stdout instead |
 | `--dry-run` | validate and preview `--edit` tool calls without changing files |
-| `-y`, `--yes` | apply `--edit` tool calls without prompting |
+| `-y`, `--yes` | apply `--edit` tool calls without prompting (except when the plan matches the last apply in the same directory) |
 | `-h`, `--help` | show help |
 | `-v`, `--version` | show version |
 
@@ -115,8 +115,11 @@ pastepatch --init . -- --line-numbers --template node
    Copy ChatGPT's fenced JSON code block with the code block copy button before
    running the command. The CLI reads the tool plan from your clipboard,
    previews the parsed tool calls, and asks for confirmation before changing
-   files. If the clipboard does not contain valid JSON in the expected tool
-   format, it prints an error and does not change files. When changes are
+   files. If the pasted plan matches the most recent apply in the same
+   directory (for example, you forgot to copy a new ChatGPT block), pastepatch
+   prints a clear warning and requires an explicit `y` to re-apply, even when
+   `--yes` is set. If the clipboard does not contain valid JSON in the expected
+   tool format, it prints an error and does not change files. When changes are
    applied, pastepatch stores an undo snapshot under `.git/pastepatch/history`
    if the current directory is inside a git repository, so the history is not
    tracked by git.
