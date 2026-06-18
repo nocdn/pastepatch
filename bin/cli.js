@@ -56,7 +56,9 @@ async function main() {
     throw new Error(`Choose --init, --edit, --undo, or --log. Run ${commandName(packageInfo)} --help for usage.`);
   } catch (error) {
     await logger(`ERROR ${error.stack || error.message}`);
-    process.stderr.write(`Error: ${error.message}\n`);
+    if (!error.reported) {
+      process.stderr.write(`Error: ${error.message}\n`);
+    }
     process.stderr.write(`Log: ${logPath()}\n`);
     process.exitCode = 1;
   }
@@ -364,7 +366,23 @@ async function runEdit(args, logger) {
     process.stderr.write(`${index + 1}. ${describeCall(call)}\n`);
   }
 
-  await preflightToolCalls(calls, root);
+  try {
+    await preflightToolCalls(calls, root);
+  } catch (error) {
+    if (Number.isInteger(error.callIndex)) {
+      reportToolCallFailure({
+        calls,
+        failedIndex: error.callIndex,
+        tool: error.callTool,
+        detail: error.callDetail,
+        appliedCount: 0,
+        phase: "preflight",
+      });
+      await logger(`EDIT preflight failed at tool call ${error.callIndex + 1}: ${error.callDetail}`);
+      error.reported = true;
+    }
+    throw error;
+  }
 
   const duplicatePlan = await findDuplicateAppliedPlan(calls, root);
 
@@ -407,7 +425,21 @@ async function runEdit(args, logger) {
 
   for (const [index, call] of calls.entries()) {
     await logger(`TOOL ${index + 1}/${calls.length} ${JSON.stringify(redactLargeFields(call))}`);
-    await executeToolCall(call, root);
+    try {
+      await executeToolCall(call, root);
+    } catch (error) {
+      reportToolCallFailure({
+        calls,
+        failedIndex: index,
+        tool: call.tool || "unknown",
+        detail: error.message,
+        appliedCount: index,
+        phase: "apply",
+      });
+      await logger(`EDIT apply failed at tool call ${index + 1}: ${error.message}`);
+      error.reported = true;
+      throw error;
+    }
   }
 
   process.stderr.write(`Changes applied.\nUndo with: pastepatch --undo\nLog: ${logPath()}\n`);
@@ -860,7 +892,11 @@ async function preflightToolCalls(calls, root = process.cwd()) {
     try {
       await validateToolCall(call, root);
     } catch (error) {
-      throw new Error(`Tool call ${index + 1} (${call.tool || "unknown"}): ${error.message}`);
+      const wrapped = new Error(`Tool call ${index + 1} (${call.tool || "unknown"}): ${error.message}`);
+      wrapped.callIndex = index;
+      wrapped.callDetail = error.message;
+      wrapped.callTool = call.tool || "unknown";
+      throw wrapped;
     }
   }
 }
@@ -1272,6 +1308,72 @@ function describeCall(call) {
     return `${call.tool}: ${call.from} -> ${call.to}`;
   }
   return `${call.tool}: ${call.path || "(no path)"}`;
+}
+
+// Collapse a sorted list of 1-based numbers into compact ranges,
+// e.g. [1,2,3,5,6,9] -> "1-3, 5-6, 9".
+function formatNumberRanges(numbers) {
+  const sorted = [...new Set(numbers)].sort((a, b) => a - b);
+  const parts = [];
+  let start = null;
+  let prev = null;
+
+  for (const value of sorted) {
+    if (start === null) {
+      start = value;
+      prev = value;
+      continue;
+    }
+    if (value === prev + 1) {
+      prev = value;
+      continue;
+    }
+    parts.push(start === prev ? `${start}` : `${start}-${prev}`);
+    start = value;
+    prev = value;
+  }
+
+  if (start !== null) {
+    parts.push(start === prev ? `${start}` : `${start}-${prev}`);
+  }
+
+  return parts.join(", ");
+}
+
+function reportToolCallFailure({ calls, failedIndex, tool, detail, appliedCount, phase }) {
+  const total = calls.length;
+  const failedNumber = failedIndex + 1;
+
+  process.stderr.write(`\nTool call ${failedNumber} (${tool}): error\n`);
+  process.stderr.write(`${detail}\n\n`);
+
+  const applied = [];
+  for (let i = 1; i <= appliedCount; i += 1) {
+    applied.push(i);
+  }
+
+  const notApplied = [];
+  for (let i = failedNumber + 1; i <= total; i += 1) {
+    notApplied.push(i);
+  }
+
+  if (applied.length > 0) {
+    const label = applied.length === 1 ? "Tool call" : "Tool calls";
+    process.stderr.write(`${label} ${formatNumberRanges(applied)}: applied successfully\n`);
+  }
+
+  process.stderr.write(`Tool call ${failedNumber}: failed (not applied)\n`);
+
+  if (notApplied.length > 0) {
+    const label = notApplied.length === 1 ? "Tool call" : "Tool calls";
+    process.stderr.write(`${label} ${formatNumberRanges(notApplied)}: not applied\n`);
+  }
+
+  if (phase === "preflight") {
+    process.stderr.write(`\nNo changes were applied (validation failed before any files were edited).\n`);
+  } else if (applied.length > 0) {
+    process.stderr.write(`\nThe first ${applied.length} change${applied.length === 1 ? " is" : "s are"} already written to disk. Undo with: pastepatch --undo\n`);
+  }
 }
 
 function redactLargeFields(call) {
