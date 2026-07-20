@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { createCommandRunner, isCommandBlocked } from "../lib/commands.js";
+import { createCommandRunner, isCommandBlocked, resolveShellInvocation } from "../lib/commands.js";
 
 const tempDirectories = [];
 
@@ -23,6 +23,19 @@ test("blacklist blocks dangerous commands", () => {
   assert.ok(isCommandBlocked("sudo reboot"));
   assert.equal(isCommandBlocked("npm test"), null);
   assert.equal(isCommandBlocked("ls -la"), null);
+});
+
+test("resolveShellInvocation picks an available unix shell", () => {
+  if (process.platform === "win32") {
+    const inv = resolveShellInvocation("echo hi");
+    assert.equal(inv.shell, "cmd.exe");
+    return;
+  }
+  const inv = resolveShellInvocation("echo hi");
+  assert.ok(inv.shell);
+  assert.deepEqual(inv.shellArgs, ["-c", "echo hi"]);
+  // Must not hard-require zsh-only; bash/sh are fine on CI
+  assert.match(inv.shell, /zsh|bash|sh/);
 });
 
 test("run_command returns output for short commands", async () => {
