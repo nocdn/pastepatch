@@ -41,7 +41,7 @@ test("findFiles finds files by name", async () => {
 });
 
 test("start_here guide mentions tools and project root", () => {
-  const guide = buildStartHereGuide({ root: "/tmp/proj", version: "1.0.0" });
+  const guide = buildStartHereGuide({ root: "/tmp/proj", version: "1.1.0" });
   assert.match(guide, /\/tmp\/proj/);
   assert.match(guide, /ChatGPT/i);
   assert.match(guide, /MCP/);

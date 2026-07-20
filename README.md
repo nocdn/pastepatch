@@ -155,6 +155,10 @@ OpenAI docs: [ChatGPT developer mode](https://developers.openai.com/api/docs/gui
 | `move_file` | no | rename/move within the project |
 | `undo_last_change` | no | undo the most recent pastepatch change set |
 | `handoff` | yes | detailed session report in one markdown code block for the next chat |
+| `run_command` | no | run a shell command (cwd = project); may background after wait; output capped |
+| `get_command_output` | yes | poll a background job by `job_id` (optional `only_new`) |
+| `stop_command` | no | stop a background job (SIGTERM or force) |
+| `list_commands` | yes | list shell jobs in this MCP process |
 
 Paths are sandboxed the same way as `--edit` (relative only, no `..`, no
 symlinks). Write tools create undo history under `.git/pastepatch/history` (or
