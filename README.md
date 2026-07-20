@@ -1,8 +1,8 @@
 # pastepatch
 
-A CLI for coding with ChatGPT's web UI: generate a full codebase prompt, paste
-ChatGPT's JSON tool plan back into the terminal, and apply the requested file
-edits locally.
+A CLI for coding with ChatGPT's web UI — either via clipboard JSON tool plans,
+or via a remote **MCP server** exposed through Cloudflare Tunnel so ChatGPT can
+call tools that read and edit files on your machine.
 
 ## Install and run
 
@@ -33,6 +33,8 @@ pastepatch --init [path] [options] [-- ingest-options]
 pastepatch --edit [options]
 pastepatch --undo
 pastepatch --log
+pastepatch --mcp [path] [options]
+pastepatch --mcp --setup-tunnel
 ```
 
 | flag | description |
@@ -41,7 +43,16 @@ pastepatch --log
 | `--edit` | read the ChatGPT JSON tool plan from the clipboard and apply the file edits |
 | `--undo` | undo the most recent applied pastepatch change set |
 | `--log`, `--last-log` | print the pastepatch log for the current directory |
-| `--path <path>` | project path for `--init`; a positional path also works; defaults to the current directory |
+| `--mcp` | start local MCP + Cloudflare Tunnel (requires `cloudflared`; uses `~/.pastepatch/` after setup) |
+| `--setup-tunnel` | one-time automated tunnel setup (login, create tunnel, DNS, save config) |
+| `--path <path>` | project path for `--init` / `--mcp`; a positional path also works; defaults to the current directory |
+| `--port <n>` | MCP listen port (default `8787`, or saved / `PASTEPATCH_MCP_PORT`) |
+| `--hostname <host>` | public hostname for setup / display (e.g. `mcp.bartoszbak.org`) |
+| `--tunnel-name <name>` | tunnel name for setup (default `pastepatch`) |
+| `--tunnel-token <token>` | optional dashboard token override. Env: `PASTEPATCH_TUNNEL_TOKEN` |
+| `--no-tunnel` | localhost only (still requires `cloudflared` installed) |
+| `--auth-token <token>` | require `Authorization: Bearer` on MCP HTTP (ChatGPT usually wants No auth) |
+| `--no-auth` | explicitly disable bearer auth |
 | `-m`, `--message`, `--task <text>` | provide first-turn instructions for `--init` instead of being asked interactively |
 | `-i`, `--include <pattern>` | forward an include pattern to `@nocdn/ingest`; repeatable |
 | `-e`, `--exclude <pattern>` | forward an exclude pattern to `@nocdn/ingest`; repeatable |
@@ -59,7 +70,118 @@ Anything after `--` in `--init` mode is forwarded directly to
 pastepatch --init . -- --line-numbers --template node
 ```
 
-## Workflow
+## MCP mode (ChatGPT Developer Mode + Cloudflare Tunnel)
+
+ChatGPT's web UI only connects to **remote HTTPS** MCP servers (Streamable HTTP
+or SSE), not local stdio processes. pastepatch therefore:
+
+1. Runs an MCP HTTP server on `127.0.0.1` (default port `8787`)
+2. Runs `cloudflared` against a **named tunnel** so a stable hostname on your
+   domain (e.g. `mcp.bartoszbak.org`) reaches that port
+
+### Prerequisites
+
+1. Domain on **Cloudflare DNS** (e.g. `bartoszbak.org`)
+2. **cloudflared** installed — `--mcp` exits with install instructions if missing
+
+```bash
+# macOS
+brew install cloudflared
+```
+
+Docs: [Install cloudflared](https://developers.cloudflare.com/tunnel/downloads/)
+
+### One-time setup (automated)
+
+```bash
+bunx @nocdn/pastepatch --mcp --setup-tunnel
+# optional: only the subdomain label (zone is read from cloudflared login)
+bunx @nocdn/pastepatch --mcp --setup-tunnel --hostname pastepatch
+# or a full FQDN:
+bunx @nocdn/pastepatch --mcp --setup-tunnel --hostname pastepatch.bartoszbak.org
+```
+
+This runs the official **locally-managed tunnel** CLI flow and saves config for later:
+
+1. `cloudflared tunnel login` (browser — pick your domain) if not already authenticated
+2. Reads the authorized zone from `~/.cloudflared/cert.pem` and only asks for the **subdomain** (e.g. `pastepatch` → `pastepatch.bartoszbak.org`)
+3. `cloudflared tunnel create pastepatch` (or reuses that name)
+4. Writes `~/.pastepatch/cloudflared-config.yml` (hostname → `http://127.0.0.1:8787`)
+5. `cloudflared tunnel route dns pastepatch <hostname>`
+6. Saves `~/.pastepatch/mcp-tunnel.json` (tunnel id, hostname, zone, credentials path, port)
+
+Do **not** use quick tunnels (`trycloudflare.com`): unstable URL and no SSE.
+
+Docs: [Create a locally-managed tunnel](https://developers.cloudflare.com/tunnel/advanced/local-management/create-local-tunnel/)
+
+### Run the MCP server
+
+From the project you want ChatGPT to edit:
+
+```bash
+bunx @nocdn/pastepatch --mcp
+```
+
+Uses the saved tunnel config automatically. Starts:
+
+- Local MCP: `http://127.0.0.1:8787/mcp`
+- Public URL: `https://mcp.bartoszbak.org/mcp` (your hostname from setup)
+- Legacy SSE: `https://mcp.bartoszbak.org/sse`
+
+### Connect ChatGPT
+
+1. ChatGPT → **Settings → Security and login** → enable **Developer mode**
+2. **Settings → Plugins** → create a developer-mode app
+3. MCP server URL: `https://mcp.bartoszbak.org/mcp` (your hostname)
+4. Authentication: **No authentication** (keep the URL private)
+5. In a chat, open **+ → Developer mode** and enable your app
+
+OpenAI docs: [ChatGPT developer mode](https://developers.openai.com/api/docs/guides/developer-mode)
+
+### MCP tools
+
+| tool | read-only | description |
+| --- | --- | --- |
+| `start_here` | yes | agent role, project root, tool guide — call at session start |
+| `project_info` | yes | absolute project root bound to this server |
+| `list_directory` | yes | list a directory (relative path) |
+| `find_files` | yes | find files by name (`fd`, else `find`) |
+| `search` | yes | search contents (`rg`, else `grep`) |
+| `read_file` | yes | read a UTF-8 file (relative path) |
+| `create_file` | no | create or overwrite a file |
+| `replace_in_file` | no | exact string replace (optional `replaceAll`) |
+| `append_to_file` | no | append text |
+| `delete_file` | no | delete file or directory |
+| `move_file` | no | rename/move within the project |
+| `undo_last_change` | no | undo the most recent pastepatch change set |
+| `handoff` | yes | detailed session report in one markdown code block for the next chat |
+
+Paths are sandboxed the same way as `--edit` (relative only, no `..`, no
+symlinks). Write tools create undo history under `.git/pastepatch/history` (or
+`.pastepatch/history`).
+
+### Security
+
+**Path sandbox (default ON):** tools can only read/write under the bound project directory
+(and subfolders). Absolute paths and `..` are rejected. Lift with `--allow-outside`
+(discouraged).
+
+Anyone who can reach the public MCP URL can invoke write tools. Mitigations:
+
+- Use a non-guessable subdomain and keep the tunnel token secret
+- Only run `--mcp` while you are actively coding
+- Optionally put [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/policies/access/) in front of the hostname
+- Optional `--auth-token` for non-ChatGPT clients (ChatGPT No-auth mode will not send it)
+
+Help:
+
+```bash
+pastepatch --help          # all modes
+pastepatch --mcp -h        # MCP options only
+pastepatch --mcp --help    # same
+```
+
+## Clipboard workflow
 
 1. From the project you want ChatGPT to edit, generate the initial prompt:
 

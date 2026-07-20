@@ -1,20 +1,28 @@
 #!/usr/bin/env node
-import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline/promises";
-import {
-  appendFile,
-  lstat,
-  mkdir,
-  readdir,
-  readFile,
-  realpath,
-  rename,
-  rm,
-  writeFile,
-} from "node:fs/promises";
+import { appendFile, mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
+import { describeCall, executeToolCall, validateToolCall } from "../lib/fs-ops.js";
+import {
+  createHistoryEntry,
+  findDuplicateAppliedPlan,
+  redactLargeFields,
+  undoLatestChange,
+} from "../lib/history.js";
+import { startMcpHttpServer } from "../lib/mcp-server.js";
+import { formatProjectBanner, resolveProjectRoot } from "../lib/project.js";
+import {
+  formatSetupCompleteMessage,
+  loadTunnelConfig,
+  requireCloudflaredBinary,
+  saveTunnelConfig,
+  setupTunnelInteractive,
+  startCloudflaredWithConfig,
+  startCloudflaredWithToken,
+  writeCloudflaredConfigFile,
+} from "../lib/tunnel.js";
 
 async function main() {
   const packageInfo = await readPackageInfo();
@@ -24,7 +32,7 @@ async function main() {
     const args = parseArgs(process.argv.slice(2), packageInfo);
 
     if (args.help) {
-      process.stdout.write(helpText(packageInfo));
+      process.stdout.write(args.mcp ? mcpHelpText(packageInfo) : helpText(packageInfo));
       return;
     }
 
@@ -53,7 +61,14 @@ async function main() {
       return;
     }
 
-    throw new Error(`Choose --init, --edit, --undo, or --log. Run ${commandName(packageInfo)} --help for usage.`);
+    if (args.mcp) {
+      await runMcp(args, packageInfo, logger);
+      return;
+    }
+
+    throw new Error(
+      `Choose --init, --edit, --undo, --log, or --mcp. Run ${commandName(packageInfo)} --help for usage.`,
+    );
   } catch (error) {
     await logger(`ERROR ${error.stack || error.message}`);
     if (!error.reported) {
@@ -72,7 +87,9 @@ function parseArgs(argv, packageInfo) {
     edit: false,
     undo: false,
     log: false,
+    mcp: false,
     path: ".",
+    pathExplicit: false,
     stdout: false,
     noClipboard: false,
     dryRun: false,
@@ -81,6 +98,17 @@ function parseArgs(argv, packageInfo) {
     include: [],
     exclude: [],
     ingestArgs: [],
+    port: process.env.PASTEPATCH_MCP_PORT ? Number(process.env.PASTEPATCH_MCP_PORT) : null,
+    hostname: process.env.PASTEPATCH_MCP_HOSTNAME || "",
+    tunnelToken: process.env.PASTEPATCH_TUNNEL_TOKEN || process.env.CLOUDFLARE_TUNNEL_TOKEN || "",
+    tunnelName: process.env.PASTEPATCH_TUNNEL_NAME || "",
+    noTunnel: false,
+    setupTunnel: false,
+    authToken: process.env.PASTEPATCH_MCP_TOKEN || "",
+    noAuth: false,
+    verbose: false,
+    allowHome: false,
+    allowOutside: false,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -116,6 +144,17 @@ function parseArgs(argv, packageInfo) {
       continue;
     }
 
+    if (arg === "--mcp") {
+      args.mcp = true;
+      continue;
+    }
+
+    if (arg === "--setup-tunnel") {
+      args.setupTunnel = true;
+      args.mcp = true;
+      continue;
+    }
+
     if (arg === "--stdout") {
       args.stdout = true;
       continue;
@@ -136,8 +175,64 @@ function parseArgs(argv, packageInfo) {
       continue;
     }
 
+    if (arg === "--no-tunnel") {
+      args.noTunnel = true;
+      continue;
+    }
+
+    if (arg === "--no-auth") {
+      args.noAuth = true;
+      continue;
+    }
+
+    if (arg === "--verbose") {
+      args.verbose = true;
+      continue;
+    }
+
     if (arg === "--path") {
       args.path = readOptionValue(argv, (index += 1), arg);
+      args.pathExplicit = true;
+      continue;
+    }
+
+    if (arg === "--allow-home") {
+      args.allowHome = true;
+      continue;
+    }
+
+    if (arg === "--allow-outside") {
+      args.allowOutside = true;
+      continue;
+    }
+
+    if (arg === "--port") {
+      const raw = readOptionValue(argv, (index += 1), arg);
+      const port = Number(raw);
+      if (!Number.isInteger(port) || port < 1 || port > 65535) {
+        throw new Error(`--port must be an integer 1-65535, got "${raw}".`);
+      }
+      args.port = port;
+      continue;
+    }
+
+    if (arg === "--hostname") {
+      args.hostname = readOptionValue(argv, (index += 1), arg);
+      continue;
+    }
+
+    if (arg === "--tunnel-token") {
+      args.tunnelToken = readOptionValue(argv, (index += 1), arg);
+      continue;
+    }
+
+    if (arg === "--tunnel-name") {
+      args.tunnelName = readOptionValue(argv, (index += 1), arg);
+      continue;
+    }
+
+    if (arg === "--auth-token") {
+      args.authToken = readOptionValue(argv, (index += 1), arg);
       continue;
     }
 
@@ -168,11 +263,12 @@ function parseArgs(argv, packageInfo) {
     }
 
     args.path = arg;
+    args.pathExplicit = true;
   }
 
-  const modes = [args.init, args.edit, args.undo, args.log].filter(Boolean).length;
+  const modes = [args.init, args.edit, args.undo, args.log, args.mcp].filter(Boolean).length;
   if (modes > 1) {
-    throw new Error("Choose only one mode: --init, --edit, --undo, or --log.");
+    throw new Error("Choose only one mode: --init, --edit, --undo, --log, or --mcp.");
   }
 
   return args;
@@ -447,31 +543,193 @@ async function runEdit(args, logger) {
 }
 
 async function runUndo(logger) {
-  const entry = await readLatestUndoableHistoryEntry();
-
-  if (!entry) {
-    throw new Error("No pastepatch history entry to undo.");
-  }
-
-  const root = path.resolve(entry.cwd || process.cwd());
-
-  for (const snapshot of entry.snapshots) {
-    await assertRemovableCurrentPathSafe(snapshot.path, root);
-    await rm(safePath(snapshot.path, root), { recursive: true, force: true });
-  }
-
-  for (const snapshot of entry.snapshots) {
-    if (snapshot.type !== "missing") {
-      await restoreSnapshot(snapshot, root);
-    }
-  }
-
-  entry.undoneAt = new Date().toISOString();
-  await writeFile(entry.historyPath, JSON.stringify(stripHistoryPath(entry), null, 2), "utf8");
+  const entry = await undoLatestChange(process.cwd());
   await logger(`UNDO ${entry.id}`);
   process.stderr.write(
     `Undid ${entry.calls.length} tool call${entry.calls.length === 1 ? "" : "s"} from ${entry.createdAt}.\nLog: ${logPath()}\n`,
   );
+}
+
+async function runMcp(args, packageInfo, logger) {
+  const command = commandName(packageInfo);
+  const binary = await requireCloudflaredBinary({ packageName: command });
+
+  if (args.setupTunnel) {
+    const existing = await loadTunnelConfig();
+    const tunnelName = args.tunnelName || existing?.tunnelName || "pastepatch";
+    const config = await setupTunnelInteractive({
+      binary,
+      hostname: args.hostname,
+      port: args.port ?? existing?.port ?? 8787,
+      tunnelName,
+      packageName: command,
+      logger,
+      existingConfig: existing,
+    });
+    process.stdout.write(formatSetupCompleteMessage({ config, packageName: command }));
+    return;
+  }
+
+  const root = await resolveProjectRoot({
+    pathArg: args.path,
+    pathExplicit: args.pathExplicit,
+    allowHome: args.allowHome,
+  });
+
+  const saved = await loadTunnelConfig();
+  const port = args.port ?? saved?.port ?? 8787;
+  let hostname = (args.hostname || saved?.hostname || "")
+    .replace(/^https?:\/\//, "")
+    .replace(/\/$/, "");
+  const authToken = args.noAuth ? null : args.authToken || null;
+  const envToken = args.tunnelToken || "";
+
+  // Resolve how to run the tunnel: saved local credentials (preferred) or env token.
+  let tunnelMode = null; // "config" | "token" | null
+  let tunnelConfigFile = saved?.cloudflaredConfigFile || null;
+  let tunnelIdOrName = saved?.tunnelId || saved?.tunnelName || null;
+
+  if (!args.noTunnel) {
+    if (envToken) {
+      tunnelMode = "token";
+    } else if (saved?.credentialsFile && saved?.tunnelId && saved?.hostname) {
+      hostname = hostname || saved.hostname;
+      // Refresh config.yml in case --port / hostname changed
+      tunnelConfigFile = await writeCloudflaredConfigFile({
+        tunnelId: saved.tunnelId,
+        credentialsFile: saved.credentialsFile,
+        hostname,
+        port,
+      });
+      tunnelIdOrName = saved.tunnelId;
+      tunnelMode = "config";
+      if (saved.port !== port || saved.hostname !== hostname || saved.cloudflaredConfigFile !== tunnelConfigFile) {
+        await saveTunnelConfig({
+          ...saved,
+          hostname,
+          port,
+          cloudflaredConfigFile: tunnelConfigFile,
+          updatedAt: new Date().toISOString(),
+        });
+      }
+    } else {
+      throw new Error(
+        `No Cloudflare tunnel configured yet.\n\n` +
+          `Run one-time setup (creates tunnel + DNS + saves config to ~/.pastepatch/):\n` +
+          `  ${command} --mcp --setup-tunnel\n\n` +
+          `Or pass a dashboard tunnel token:\n` +
+          `  ${command} --mcp --tunnel-token "$PASTEPATCH_TUNNEL_TOKEN"\n\n` +
+          `For local-only testing without a public URL:\n` +
+          `  ${command} --mcp --no-tunnel`,
+      );
+    }
+  }
+
+  if (args.allowOutside) {
+    process.stderr.write(
+      "WARNING: --allow-outside is enabled. MCP tools can read/write paths outside the project root.\n",
+    );
+  }
+
+  process.stderr.write(
+    formatProjectBanner({
+      root,
+      port,
+      hostname,
+      verbose: args.verbose,
+      noTunnel: args.noTunnel,
+      allowOutside: args.allowOutside,
+    }),
+  );
+
+  const mcp = await startMcpHttpServer({
+    root,
+    port,
+    host: "127.0.0.1",
+    version: packageInfo.version,
+    logger,
+    authToken,
+    allowedHosts: hostname ? [hostname] : [],
+    verbose: args.verbose,
+    allowOutside: args.allowOutside,
+  });
+
+  await logger(
+    `MCP listening root=${root} port=${port} verbose=${args.verbose} allowOutside=${args.allowOutside}`,
+  );
+
+  let tunnelHandle = null;
+
+  if (tunnelMode === "config") {
+    process.stderr.write("Starting Cloudflare Tunnel (local credentials + config)...\n");
+    if (!args.verbose) {
+      process.stderr.write("Tunnel logs quiet (pass --verbose for cloudflared/HTTP details).\n");
+    }
+    tunnelHandle = startCloudflaredWithConfig({
+      binary,
+      configFile: tunnelConfigFile,
+      tunnelIdOrName,
+      logger,
+      verbose: args.verbose,
+    });
+  } else if (tunnelMode === "token") {
+    process.stderr.write("Starting Cloudflare Tunnel (token)...\n");
+    if (!args.verbose) {
+      process.stderr.write("Tunnel logs quiet (pass --verbose for cloudflared/HTTP details).\n");
+    }
+    tunnelHandle = startCloudflaredWithToken({
+      token: envToken,
+      binary,
+      logger,
+      verbose: args.verbose,
+    });
+  } else {
+    process.stderr.write("Tunnel disabled (--no-tunnel). MCP is only on localhost.\n");
+  }
+
+  if (tunnelHandle) {
+    tunnelHandle.exitPromise.catch(async (error) => {
+      process.stderr.write(`Error: ${error.message}\n`);
+      await logger(`MCP tunnel error: ${error.message}`);
+      await mcp.close();
+      process.exitCode = 1;
+      process.exit(1);
+    });
+  }
+
+  if (hostname) {
+    process.stderr.write(`Public MCP URL (ChatGPT): https://${hostname}/mcp\n`);
+    process.stderr.write(`Legacy SSE URL: https://${hostname}/sse\n`);
+  }
+
+  if (authToken) {
+    process.stderr.write(
+      "Auth: Bearer token required (Authorization: Bearer …). ChatGPT developer mode usually uses No authentication — prefer Cloudflare Access or --no-auth for ChatGPT.\n",
+    );
+  } else {
+    process.stderr.write(
+      "Auth: none (suitable for ChatGPT No authentication). Anyone who can reach the public URL can call write tools.\n",
+    );
+  }
+
+  process.stderr.write("Press Ctrl+C to stop.\n");
+
+  const shutdown = async (signal) => {
+    process.stderr.write(`\nShutting down (${signal})...\n`);
+    tunnelHandle?.kill();
+    await mcp.close();
+    process.exit(0);
+  };
+
+  process.on("SIGINT", () => {
+    void shutdown("SIGINT");
+  });
+  process.on("SIGTERM", () => {
+    void shutdown("SIGTERM");
+  });
+
+  // Keep process alive until signal
+  await new Promise(() => {});
 }
 
 async function runLog() {
@@ -486,268 +744,12 @@ async function runLog() {
   }
 }
 
-async function createHistoryEntry(calls, root = process.cwd()) {
-  const id = `${new Date().toISOString().replace(/[:.]/g, "-")}-${process.pid}`;
-  const historyDirectory = await historyDir();
-  const historyPath = path.join(historyDirectory, `${id}.json`);
-  const affectedPaths = [...new Set(calls.flatMap(affectedPathsForCall))];
-  const snapshots = [];
-
-  for (const relativePath of affectedPaths) {
-    snapshots.push(await snapshotPath(relativePath, root));
-  }
-
-  const entry = {
-    id,
-    version: 1,
-    createdAt: new Date().toISOString(),
-    cwd: root,
-    callsDigest: toolPlanDigest(calls),
-    calls: calls.map(redactLargeFields),
-    snapshots,
-  };
-
-  await mkdir(historyDirectory, { recursive: true });
-  await writeFile(historyPath, JSON.stringify(entry, null, 2), "utf8");
-  return { ...entry, path: historyPath };
-}
-
-function affectedPathsForCall(call) {
-  if (call.tool === "move_file") {
-    return [call.from, call.to].filter(Boolean).map(normalizeRelativePath);
-  }
-
-  if (call.path) {
-    return [normalizeRelativePath(call.path)];
-  }
-
-  return [];
-}
-
-async function snapshotPath(relativePath, root = process.cwd()) {
-  const normalizedPath = normalizeRelativePath(relativePath);
-  const absolutePath = safePath(normalizedPath, root);
-
-  try {
-    const stats = await lstat(absolutePath);
-    if (stats.isSymbolicLink()) {
-      throw new Error(`${normalizedPath}: symbolic links are not supported.`);
-    }
-
-    if (stats.isDirectory()) {
-      return {
-        path: normalizedPath,
-        type: "directory",
-        entries: await snapshotDirectory(absolutePath, normalizedPath),
-      };
-    }
-
-    return {
-      path: normalizedPath,
-      type: "file",
-      content: (await readFile(absolutePath)).toString("base64"),
-    };
-  } catch (error) {
-    if (error.code === "ENOENT") {
-      return { path: normalizedPath, type: "missing" };
-    }
-    throw error;
-  }
-}
-
-async function snapshotDirectory(absoluteDirectory, relativeDirectory) {
-  const entries = [];
-  const directoryEntries = await readdir(absoluteDirectory, { withFileTypes: true });
-
-  for (const entry of directoryEntries) {
-    const relativePath = path.join(relativeDirectory, entry.name);
-    const absolutePath = path.join(absoluteDirectory, entry.name);
-
-    if (entry.isDirectory()) {
-      entries.push({
-        path: normalizeRelativePath(relativePath),
-        type: "directory",
-      });
-      entries.push(...(await snapshotDirectory(absolutePath, relativePath)));
-      continue;
-    }
-
-    if (entry.isSymbolicLink()) {
-      throw new Error(`${normalizeRelativePath(relativePath)}: symbolic links are not supported.`);
-    }
-
-    entries.push({
-      path: normalizeRelativePath(relativePath),
-      type: "file",
-      content: (await readFile(absolutePath)).toString("base64"),
-    });
-  }
-
-  return entries;
-}
-
-async function restoreSnapshot(snapshot, root = process.cwd()) {
-  if (snapshot.type === "file") {
-    const target = safePath(snapshot.path, root);
-    await assertParentPathSafe(target, root);
-    await mkdir(path.dirname(target), { recursive: true });
-    await assertDirectoryPathSafe(path.dirname(target), root);
-    await writeFile(target, Buffer.from(snapshot.content, "base64"));
-    return;
-  }
-
-  if (snapshot.type === "directory") {
-    const directory = safePath(snapshot.path, root);
-    await assertParentPathSafe(directory, root);
-    await mkdir(directory, { recursive: true });
-    await assertDirectoryPathSafe(directory, root);
-    for (const entry of snapshot.entries) {
-      if (entry.type === "directory") {
-        const entryDirectory = safePath(entry.path, root);
-        await assertParentPathSafe(entryDirectory, root);
-        await mkdir(entryDirectory, { recursive: true });
-        await assertDirectoryPathSafe(entryDirectory, root);
-        continue;
-      }
-
-      const target = safePath(entry.path, root);
-      await assertParentPathSafe(target, root);
-      await mkdir(path.dirname(target), { recursive: true });
-      await assertDirectoryPathSafe(path.dirname(target), root);
-      await writeFile(target, Buffer.from(entry.content, "base64"));
-    }
-  }
-}
-
-async function readLatestHistoryEntryForCwd(root = process.cwd()) {
-  const directory = await historyDir();
-  const resolvedRoot = path.resolve(root);
-
-  let files;
-  try {
-    files = await readdir(directory);
-  } catch (error) {
-    if (error.code === "ENOENT") {
-      return null;
-    }
-    throw error;
-  }
-
-  const historyFiles = files.filter((file) => file.endsWith(".json")).sort().reverse();
-
-  for (const file of historyFiles) {
-    const historyPath = path.join(directory, file);
-    const entry = JSON.parse(await readFile(historyPath, "utf8"));
-    if (path.resolve(entry.cwd || process.cwd()) === resolvedRoot) {
-      return { ...entry, historyPath };
-    }
-  }
-
-  return null;
-}
-
-async function readLatestUndoableHistoryEntry() {
-  const directory = await historyDir();
-
-  let files;
-  try {
-    files = await readdir(directory);
-  } catch (error) {
-    if (error.code === "ENOENT") {
-      return null;
-    }
-    throw error;
-  }
-
-  const historyFiles = files.filter((file) => file.endsWith(".json")).sort().reverse();
-
-  for (const file of historyFiles) {
-    const historyPath = path.join(directory, file);
-    const entry = JSON.parse(await readFile(historyPath, "utf8"));
-    if (!entry.undoneAt) {
-      return { ...entry, historyPath };
-    }
-  }
-
-  return null;
-}
-
-async function findDuplicateAppliedPlan(calls, root = process.cwd()) {
-  const entry = await readLatestHistoryEntryForCwd(root);
-  if (!entry?.callsDigest || entry.callsDigest !== toolPlanDigest(calls)) {
-    return null;
-  }
-
-  return entry;
-}
-
-function toolPlanDigest(calls) {
-  return createHash("sha256").update(stableJsonStringify(calls)).digest("hex");
-}
-
-function stableJsonStringify(value) {
-  if (Array.isArray(value)) {
-    return `[${value.map(stableJsonStringify).join(",")}]`;
-  }
-
-  if (value && typeof value === "object") {
-    const keys = Object.keys(value).sort();
-    return `{${keys.map((key) => `${JSON.stringify(key)}:${stableJsonStringify(value[key])}`).join(",")}}`;
-  }
-
-  return JSON.stringify(value);
-}
-
 function writeDuplicatePlanNotice(entry) {
   process.stderr.write(
     `\nWarning: This tool plan matches the most recent pastepatch apply in this directory (${entry.createdAt}).\n` +
       "You may have forgotten to copy a new ChatGPT JSON block from ChatGPT.\n" +
       "Re-applying can fail (for example, replace_in_file) or repeat side effects (for example, append_to_file).\n",
   );
-}
-
-function stripHistoryPath(entry) {
-  const { historyPath, ...rest } = entry;
-  return rest;
-}
-
-async function historyDir() {
-  const gitDirectory = await findGitDirectory(process.cwd());
-  if (gitDirectory) {
-    return path.join(gitDirectory, "pastepatch", "history");
-  }
-
-  return path.join(process.cwd(), ".pastepatch", "history");
-}
-
-async function findGitDirectory(startDirectory) {
-  let directory = startDirectory;
-
-  for (;;) {
-    const dotGit = path.join(directory, ".git");
-    try {
-      const stats = await lstat(dotGit);
-      if (stats.isDirectory()) {
-        return dotGit;
-      }
-
-      const gitFile = await readFile(dotGit, "utf8");
-      const match = gitFile.match(/^gitdir: (.+)$/m);
-      if (match) {
-        return path.resolve(directory, match[1].trim());
-      }
-    } catch (error) {
-      if (error.code !== "ENOENT") {
-        throw error;
-      }
-    }
-
-    const parent = path.dirname(directory);
-    if (parent === directory) {
-      return null;
-    }
-    directory = parent;
-  }
 }
 
 async function readToolPlanInput() {
@@ -901,415 +903,6 @@ async function preflightToolCalls(calls, root = process.cwd()) {
   }
 }
 
-async function validateToolCall(call, root = process.cwd()) {
-  switch (call.tool) {
-    case "create_file":
-      requireString(call.path, "path", call.tool);
-      requireString(call.content, "content", call.tool);
-      await assertWritableFileTarget(call.path, root);
-      return;
-
-    case "append_to_file":
-      requireString(call.path, "path", call.tool);
-      requireString(call.content, "content", call.tool);
-      await assertWritableFileTarget(call.path, root);
-      return;
-
-    case "replace_in_file":
-    case "amend_file":
-    case "amend":
-      requireString(call.path, "path", call.tool);
-      requireString(call.old, "old", call.tool);
-      requireString(call.new, "new", call.tool);
-      await assertReadableFileTarget(call.path, root);
-      await validateReplacement(call.path, call.old, Boolean(call.replaceAll), root);
-      return;
-
-    case "delete_file":
-      requireString(call.path, "path", call.tool);
-      await assertDeletableTarget(call.path, root);
-      return;
-
-    case "move_file":
-      requireString(call.from, "from", call.tool);
-      requireString(call.to, "to", call.tool);
-      await assertMovableSource(call.from, root);
-      await assertWritableMoveTarget(call.to, root);
-      return;
-
-    default:
-      throw new Error(`Unknown tool "${call.tool}".`);
-  }
-}
-
-async function executeToolCall(call, root = process.cwd()) {
-  switch (call.tool) {
-    case "create_file":
-      requireString(call.path, "path", call.tool);
-      requireString(call.content, "content", call.tool);
-      await writeTextFile(call.path, call.content, root);
-      return;
-
-    case "append_to_file":
-      requireString(call.path, "path", call.tool);
-      requireString(call.content, "content", call.tool);
-      await appendTextFile(call.path, call.content, root);
-      return;
-
-    case "replace_in_file":
-    case "amend_file":
-    case "amend":
-      requireString(call.path, "path", call.tool);
-      requireString(call.old, "old", call.tool);
-      requireString(call.new, "new", call.tool);
-      await replaceInFile(call.path, call.old, call.new, Boolean(call.replaceAll), root);
-      return;
-
-    case "delete_file":
-      requireString(call.path, "path", call.tool);
-      await assertDeletableTarget(call.path, root);
-      await rm(safePath(call.path, root), { recursive: true, force: false });
-      return;
-
-    case "move_file":
-      requireString(call.from, "from", call.tool);
-      requireString(call.to, "to", call.tool);
-      await assertMovableSource(call.from, root);
-      await assertWritableMoveTarget(call.to, root);
-      await mkdir(path.dirname(safePath(call.to, root)), { recursive: true });
-      await assertDirectoryPathSafe(path.dirname(safePath(call.to, root)), root);
-      await rename(safePath(call.from, root), safePath(call.to, root));
-      return;
-
-    default:
-      throw new Error(`Unknown tool "${call.tool}".`);
-  }
-}
-
-async function writeTextFile(relativePath, content, root = process.cwd()) {
-  await assertWritableFileTarget(relativePath, root);
-  const target = safePath(relativePath, root);
-  await assertParentPathSafe(target, root);
-  await mkdir(path.dirname(target), { recursive: true });
-  await assertDirectoryPathSafe(path.dirname(target), root);
-  await writeFile(target, content, "utf8");
-}
-
-async function appendTextFile(relativePath, content, root = process.cwd()) {
-  await assertWritableFileTarget(relativePath, root);
-  const target = safePath(relativePath, root);
-  await assertParentPathSafe(target, root);
-  await mkdir(path.dirname(target), { recursive: true });
-  await assertDirectoryPathSafe(path.dirname(target), root);
-  await appendFile(target, content, "utf8");
-}
-
-async function replaceInFile(relativePath, oldText, newText, replaceAll, root = process.cwd()) {
-  await assertReadableFileTarget(relativePath, root);
-  const target = safePath(relativePath, root);
-  const current = await readFile(target, "utf8");
-  const count = countOccurrences(current, oldText);
-
-  if (count === 0) {
-    throw new Error(`${relativePath}: old string was not found.`);
-  }
-
-  if (!replaceAll && count !== 1) {
-    throw new Error(
-      `${relativePath}: old string occurs ${count} times. Use a more specific old string or set replaceAll true.`,
-    );
-  }
-
-  const updated = replaceAll ? current.split(oldText).join(newText) : current.replace(oldText, newText);
-  await writeFile(target, updated, "utf8");
-}
-
-async function validateReplacement(relativePath, oldText, replaceAll, root = process.cwd()) {
-  const target = safePath(relativePath, root);
-  const current = await readFile(target, "utf8");
-  const count = countOccurrences(current, oldText);
-
-  if (count === 0) {
-    throw new Error(`${relativePath}: old string was not found.`);
-  }
-
-  if (!replaceAll && count !== 1) {
-    throw new Error(
-      `${relativePath}: old string occurs ${count} times. Use a more specific old string or set replaceAll true.`,
-    );
-  }
-}
-
-async function assertWritableFileTarget(relativePath, root = process.cwd()) {
-  const target = safePath(relativePath, root);
-  await assertParentPathSafe(target, root);
-
-  try {
-    const stats = await lstat(target);
-    if (stats.isSymbolicLink()) {
-      throw new Error(`${relativePath}: symbolic links are not supported.`);
-    }
-
-    if (!stats.isFile()) {
-      throw new Error(`${relativePath}: target must be a file.`);
-    }
-
-    await assertRealPathInsideRoot(target, root);
-  } catch (error) {
-    if (error.code === "ENOENT") {
-      return;
-    }
-    throw error;
-  }
-}
-
-async function assertReadableFileTarget(relativePath, root = process.cwd()) {
-  const target = safePath(relativePath, root);
-  const stats = await assertExistingTarget(relativePath, root);
-
-  if (!stats.isFile()) {
-    throw new Error(`${relativePath}: target must be a file.`);
-  }
-
-  await assertRealPathInsideRoot(target, root);
-}
-
-async function assertDeletableTarget(relativePath, root = process.cwd()) {
-  const target = safePath(relativePath, root);
-  const stats = await assertExistingTarget(relativePath, root);
-
-  if (stats.isDirectory()) {
-    await assertDirectoryTreeHasNoSymlinks(target);
-  }
-}
-
-async function assertRemovableCurrentPathSafe(relativePath, root = process.cwd()) {
-  const target = safePath(relativePath, root);
-  await assertParentPathSafe(target, root);
-
-  try {
-    const stats = await lstat(target);
-    if (stats.isSymbolicLink()) {
-      throw new Error(`${relativePath}: symbolic links are not supported.`);
-    }
-
-    if (stats.isDirectory()) {
-      await assertDirectoryTreeHasNoSymlinks(target);
-    }
-  } catch (error) {
-    if (error.code === "ENOENT") {
-      return;
-    }
-    throw error;
-  }
-}
-
-async function assertMovableSource(relativePath, root = process.cwd()) {
-  const target = safePath(relativePath, root);
-  const stats = await assertExistingTarget(relativePath, root);
-
-  if (stats.isDirectory()) {
-    await assertDirectoryTreeHasNoSymlinks(target);
-  }
-}
-
-async function assertWritableMoveTarget(relativePath, root = process.cwd()) {
-  const target = safePath(relativePath, root);
-  await assertParentPathSafe(target, root);
-
-  try {
-    const stats = await lstat(target);
-    if (stats.isSymbolicLink()) {
-      throw new Error(`${relativePath}: symbolic links are not supported.`);
-    }
-
-    if (stats.isDirectory()) {
-      await assertDirectoryTreeHasNoSymlinks(target);
-    }
-
-    await assertRealPathInsideRoot(target, root);
-  } catch (error) {
-    if (error.code === "ENOENT") {
-      return;
-    }
-    throw error;
-  }
-}
-
-async function assertExistingTarget(relativePath, root = process.cwd()) {
-  const target = safePath(relativePath, root);
-  await assertParentPathSafe(target, root);
-
-  try {
-    const stats = await lstat(target);
-    if (stats.isSymbolicLink()) {
-      throw new Error(`${relativePath}: symbolic links are not supported.`);
-    }
-    await assertRealPathInsideRoot(target, root);
-    return stats;
-  } catch (error) {
-    if (error.code === "ENOENT") {
-      throw new Error(`${relativePath}: path does not exist.`);
-    }
-    throw error;
-  }
-}
-
-async function assertParentPathSafe(absolutePath, root = process.cwd()) {
-  await assertDirectoryPathSafe(path.dirname(absolutePath), root);
-}
-
-async function assertDirectoryPathSafe(absoluteDirectory, root = process.cwd()) {
-  const rootPath = path.resolve(root);
-  const rootRealPath = await realpath(rootPath);
-  const relativeDirectory = path.relative(rootPath, absoluteDirectory);
-  const segments = relativeDirectory ? relativeDirectory.split(path.sep).filter(Boolean) : [];
-
-  let current = rootPath;
-  await assertExistingDirectoryComponentSafe(current, rootRealPath, "project root");
-
-  for (const segment of segments) {
-    current = path.join(current, segment);
-
-    try {
-      await assertExistingDirectoryComponentSafe(current, rootRealPath, displayPath(current, rootPath));
-    } catch (error) {
-      if (error.code === "ENOENT") {
-        return;
-      }
-      throw error;
-    }
-  }
-}
-
-async function assertExistingDirectoryComponentSafe(absolutePath, rootRealPath, label) {
-  const stats = await lstat(absolutePath);
-  if (stats.isSymbolicLink()) {
-    throw new Error(`${label}: parent path contains a symbolic link.`);
-  }
-
-  if (!stats.isDirectory()) {
-    throw new Error(`${label}: parent path is not a directory.`);
-  }
-
-  const realDirectory = await realpath(absolutePath);
-  assertInsideRoot(realDirectory, rootRealPath, `${label}: parent path escapes the project root.`);
-}
-
-async function assertRealPathInsideRoot(absolutePath, root = process.cwd()) {
-  const rootRealPath = await realpath(path.resolve(root));
-  const targetRealPath = await realpath(absolutePath);
-  assertInsideRoot(targetRealPath, rootRealPath, `${displayPath(absolutePath, root)}: path escapes the project root.`);
-}
-
-async function assertDirectoryTreeHasNoSymlinks(absoluteDirectory) {
-  const entries = await readdir(absoluteDirectory, { withFileTypes: true });
-
-  for (const entry of entries) {
-    const absolutePath = path.join(absoluteDirectory, entry.name);
-    if (entry.isSymbolicLink()) {
-      throw new Error(`${absolutePath}: symbolic links are not supported.`);
-    }
-
-    if (entry.isDirectory()) {
-      await assertDirectoryTreeHasNoSymlinks(absolutePath);
-    }
-  }
-}
-
-function assertInsideRoot(targetPath, rootPath, message) {
-  const relative = path.relative(rootPath, targetPath);
-  if (relative === "" || !pathEscapesRoot(relative)) {
-    return;
-  }
-
-  throw new Error(message);
-}
-
-function displayPath(absolutePath, root = process.cwd()) {
-  const relative = path.relative(path.resolve(root), absolutePath);
-  return relative || ".";
-}
-
-function safePath(relativePath, root = process.cwd()) {
-  if (typeof relativePath !== "string" || relativePath.length === 0) {
-    throw new Error("Path must be a non-empty string.");
-  }
-
-  if (relativePath.includes("\0")) {
-    throw new Error("Path must not contain null bytes.");
-  }
-
-  if (
-    path.isAbsolute(relativePath) ||
-    path.posix.isAbsolute(relativePath) ||
-    path.win32.isAbsolute(relativePath) ||
-    /^[A-Za-z]:/.test(relativePath)
-  ) {
-    throw new Error(`Refusing absolute path: ${relativePath}`);
-  }
-
-  const segments = relativePath.split(/[\\/]+/);
-  if (segments.some((segment) => segment === "..")) {
-    throw new Error(`Refusing path containing "..": ${relativePath}`);
-  }
-
-  const normalizedSegments = segments.filter((segment) => segment !== "" && segment !== ".");
-  if (normalizedSegments.length === 0) {
-    throw new Error("Path must target a file or subdirectory, not the project root.");
-  }
-
-  const rootPath = path.resolve(root);
-  const normalized = path.join(...normalizedSegments);
-  const target = path.resolve(rootPath, normalized);
-  const relativeToRoot = path.relative(rootPath, target);
-  if (relativeToRoot === "" || pathEscapesRoot(relativeToRoot)) {
-    throw new Error(`Refusing path outside the project root: ${relativePath}`);
-  }
-
-  return target;
-}
-
-function pathEscapesRoot(relativePath) {
-  return relativePath === ".." || relativePath.startsWith(`..${path.sep}`) || path.isAbsolute(relativePath);
-}
-
-function normalizeRelativePath(relativePath) {
-  safePath(relativePath);
-  return path.join(...relativePath.split(/[\\/]+/).filter((segment) => segment !== "" && segment !== "."));
-}
-
-function requireString(value, field, tool) {
-  if (typeof value !== "string") {
-    throw new Error(`${tool} requires a string "${field}" field.`);
-  }
-}
-
-function countOccurrences(haystack, needle) {
-  if (needle === "") {
-    throw new Error("old string must not be empty.");
-  }
-
-  let count = 0;
-  let index = 0;
-
-  for (;;) {
-    index = haystack.indexOf(needle, index);
-    if (index === -1) {
-      return count;
-    }
-    count += 1;
-    index += needle.length;
-  }
-}
-
-function describeCall(call) {
-  if (call.tool === "move_file") {
-    return `${call.tool}: ${call.from} -> ${call.to}`;
-  }
-  return `${call.tool}: ${call.path || "(no path)"}`;
-}
-
 // Collapse a sorted list of 1-based numbers into compact ranges,
 // e.g. [1,2,3,5,6,9] -> "1-3, 5-6, 9".
 function formatNumberRanges(numbers) {
@@ -1374,16 +967,6 @@ function reportToolCallFailure({ calls, failedIndex, tool, detail, appliedCount,
   } else if (applied.length > 0) {
     process.stderr.write(`\nThe first ${applied.length} change${applied.length === 1 ? " is" : "s are"} already written to disk. Undo with: pastepatch --undo\n`);
   }
-}
-
-function redactLargeFields(call) {
-  const copy = { ...call };
-  for (const field of ["content", "old", "new"]) {
-    if (typeof copy[field] === "string") {
-      copy[field] = `<${Buffer.byteLength(copy[field])} bytes>`;
-    }
-  }
-  return copy;
 }
 
 async function confirm(message) {
@@ -1619,6 +1202,11 @@ Usage:
   ${command} --edit [options]
   ${command} --undo
   ${command} --log
+  ${command} --mcp [path] [options]
+  ${command} --mcp --setup-tunnel
+  ${command} --mcp -h
+  ${command} --help
+  ${command} --version
 
 Examples:
   ${command} --init
@@ -1629,32 +1217,93 @@ Examples:
   ${editYesExample}
   ${command} --undo
   ${command} --log
+  ${command} --mcp
+  ${command} --mcp --setup-tunnel
+  ${command} --mcp --path ./my-app
   ${command} --help
-  ${command} --version
+  ${command} --mcp -h
 
-Options:
+Modes:
   --init                           Generate the initial ChatGPT coding prompt with a codebase digest.
   --edit                           Apply the ChatGPT JSON tool plan currently on the clipboard.
   --undo                           Undo the most recent applied pastepatch change set.
   --log, --last-log                Print the pastepatch log for the current directory.
-  --path <path>                    Project path for --init. A positional path also works. Default: current directory.
-  -m, --message, --task <text>      First-turn instructions to include in the --init prompt instead of asking interactively.
+  --mcp                            Start MCP server + Cloudflare Tunnel for live ChatGPT tools.
+
+--init options:
+  --path <path>                    Project path (positional path also works). Default: current directory.
+  -m, --message, --task <text>      First-turn instructions instead of asking interactively.
   -i, --include <pattern>          Forward an include pattern to @nocdn/ingest. Repeatable.
   -e, --exclude <pattern>          Forward an exclude pattern to @nocdn/ingest. Repeatable.
-  --stdout                         Print the --init prompt to stdout. Also copies it unless --no-clipboard is set.
-  --no-clipboard                   Do not copy the --init prompt; print it to stdout instead.
-  --dry-run                        Validate and preview --edit tool calls without changing files.
-  -y, --yes                        Apply --edit tool calls without prompting (except when the plan matches the last apply).
-  -h, --help                       Show this help text.
+  --stdout                         Print the prompt to stdout (still copies unless --no-clipboard).
+  --no-clipboard                   Do not copy the prompt; print to stdout instead.
+  --                               Forward remaining args to @nocdn/ingest.
+
+--edit options:
+  --dry-run                        Validate/preview tool calls without changing files.
+  -y, --yes                        Apply without prompting (except duplicate last plan).
+
+--mcp options:
+  Run \`${command} --mcp -h\` for the full MCP-only option list.
+
+Global:
+  -h, --help                       Show this full help (all modes).
   -v, --version                    Show the package version.
 
 Notes:
   --init runs: bunx @nocdn/ingest <path> --stdout, falling back to npx -y if bunx is unavailable.
-  Anything after -- is forwarded directly to @nocdn/ingest.
-  --edit reads from the clipboard when run interactively, or from stdin when piped (${clipboardPipeExample()}).
-  --edit stores undo history under .git/pastepatch/history when run inside a git repository.
-  --edit warns and requires confirmation when the pasted plan matches the most recent apply in the same directory.
-  --edit writes details and errors to .pastepatch.log in the current directory.
+  --edit reads from the clipboard when interactive, or stdin when piped (${clipboardPipeExample()}).
+  --edit/--mcp write details to .pastepatch.log in the current directory.
+  Paths for --edit are sandboxed to the current directory (no absolute paths, no "..").
+`;
+}
+
+function mcpHelpText(packageInfo) {
+  const command = commandName(packageInfo);
+  return `${command} ${packageInfo.version} — MCP mode
+
+Usage:
+  ${command} --mcp [path] [options]
+  ${command} --mcp --setup-tunnel [options]
+  ${command} --mcp -h
+  ${command} --mcp --help
+
+Examples:
+  ${command} --mcp
+  ${command} --mcp --path ~/code/my-app
+  ${command} --mcp --setup-tunnel
+  ${command} --mcp --setup-tunnel --hostname pastepatch
+  ${command} --mcp --no-tunnel
+  ${command} --mcp --verbose
+  ${command} --mcp --allow-outside
+
+Options:
+  --mcp                            Start the pastepatch MCP server (required for this help page).
+  --setup-tunnel                   One-time Cloudflare tunnel setup (login, DNS, save ~/.pastepatch/).
+  --path <path>                    Project root to bind tools to. Positional path works. Default: cwd.
+  --port <n>                       Listen port (default 8787, or saved / PASTEPATCH_MCP_PORT).
+  --hostname <host>                Setup: subdomain (pastepatch) or FQDN. Env: PASTEPATCH_MCP_HOSTNAME.
+  --tunnel-name <name>             Setup tunnel name (default pastepatch; also default subdomain).
+  --tunnel-token <token>           Optional dashboard token override. Env: PASTEPATCH_TUNNEL_TOKEN.
+  --no-tunnel                      Localhost MCP only (still requires cloudflared installed).
+  --auth-token <token>             Require Authorization: Bearer. Env: PASTEPATCH_MCP_TOKEN.
+  --no-auth                        Disable bearer auth (default; use ChatGPT "No Auth").
+  --verbose                        Cloudflared/HTTP logs + replace/create payload previews.
+  --allow-home                     Allow binding project root to $HOME or filesystem root.
+  --allow-outside                  Disable path sandbox (allow absolute paths and paths outside the project).
+                                   Default is sandboxed: cannot read/create/edit/delete outside the bound root.
+  -h, --help                       Show this MCP-only help (when combined with --mcp).
+
+Sandbox (default ON):
+  Tools only operate inside the bound project directory (and its subfolders).
+  Relative paths only; absolute paths and ".." are rejected.
+  Pass --allow-outside to lift this restriction (dangerous).
+
+Notes:
+  Requires cloudflared. First time: ${command} --mcp --setup-tunnel
+  Then: ${command} --mcp   (starts local MCP + tunnel from ~/.pastepatch/)
+  ChatGPT plugin URL: https://<hostname>/mcp   Authentication: No Auth
+  For full CLI help (all modes): ${command} --help
 `;
 }
 

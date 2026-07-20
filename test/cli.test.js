@@ -24,6 +24,27 @@ test("help uses the executable bin name", async () => {
   assert.equal(result.code, 0);
   assert.match(result.stdout, /Usage:\n  pastepatch --init/);
   assert.doesNotMatch(result.stdout, /@nocdn\/pastepatch --edit/);
+  assert.match(result.stdout, /--mcp -h/);
+});
+
+test("--mcp -h shows MCP-only help", async () => {
+  const result = await runCli(["--mcp", "-h"]);
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /MCP mode/);
+  assert.match(result.stdout, /--allow-outside/);
+  assert.match(result.stdout, /--setup-tunnel/);
+  assert.match(result.stdout, /Sandbox/);
+  assert.doesNotMatch(result.stdout, /--dry-run/);
+  assert.doesNotMatch(result.stdout, /@nocdn\/ingest/);
+});
+
+test("--help includes all modes and points to --mcp -h", async () => {
+  const result = await runCli(["--help"]);
+  assert.equal(result.code, 0);
+  assert.match(result.stdout, /--init/);
+  assert.match(result.stdout, /--edit/);
+  assert.match(result.stdout, /--mcp/);
+  assert.match(result.stdout, /--mcp -h/);
 });
 
 test("dry run rejects invalid and stale tool plans", async () => {
