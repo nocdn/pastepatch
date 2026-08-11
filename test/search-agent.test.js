@@ -49,6 +49,10 @@ test("start_here guide mentions tools and project root", () => {
   assert.match(guide, /search/);
   assert.match(guide, /replace_in_file/);
   assert.match(guide, /handoff/);
+  assert.match(guide, /list_remote_skills/);
+  assert.match(guide, /read_remote_skill/);
+  assert.match(guide, /stop_session/);
+  assert.match(guide, /view_image/);
   assert.doesNotMatch(guide, /local coding agent/i);
 });
 
@@ -88,6 +92,10 @@ test("project banner includes Editing path", () => {
   assert.match(banner, /Editing:\s+\/tmp\/my-app/);
   assert.match(banner, /pastepatch\.example\.com\/mcp/);
   assert.match(banner, /Sandbox:\s+ON/);
+  // Banner body is not indented (only the frame is decorative)
+  assert.match(banner, /^pastepatch MCP$/m);
+  assert.match(banner, /^Editing:/m);
+  assert.doesNotMatch(banner, /^ {2}pastepatch MCP$/m);
 });
 
 test("path sandbox blocks outside paths by default", async () => {
@@ -126,7 +134,17 @@ test("MCP exposes search, find_files, start_here, handoff", async () => {
 
     const tools = await client.listTools();
     const names = new Set(tools.tools.map((tool) => tool.name));
-    for (const name of ["search", "find_files", "start_here", "handoff", "read_file"]) {
+    for (const name of [
+      "search",
+      "find_files",
+      "start_here",
+      "handoff",
+      "read_file",
+      "list_remote_skills",
+      "read_remote_skill",
+      "stop_session",
+      "view_image",
+    ]) {
       assert.ok(names.has(name), `missing tool ${name}`);
     }
 

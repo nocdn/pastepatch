@@ -128,6 +128,12 @@ Uses the saved tunnel config automatically. Starts:
 - Public URL: `https://mcp.bartoszbak.org/mcp` (your hostname from setup)
 - Legacy SSE: `https://mcp.bartoszbak.org/sse`
 
+Only **one** `pastepatch --mcp` process may run at a time on a machine (lock file
+`~/.pastepatch/mcp.lock`). A second start exits with instructions to stop the
+other session first — otherwise the shared Cloudflare tunnel can drop or scramble
+the ChatGPT connection. Stop via Ctrl+C, the `stop_session` MCP tool, or
+`kill <pid>`.
+
 ### Connect ChatGPT
 
 1. ChatGPT → **Settings → Security and login** → enable **Developer mode**
@@ -148,6 +154,7 @@ OpenAI docs: [ChatGPT developer mode](https://developers.openai.com/api/docs/gui
 | `find_files` | yes | find files by name (`fd`, else `find`) |
 | `search` | yes | search contents (`rg`, else `grep`) |
 | `read_file` | yes | read a UTF-8 file (relative path) |
+| `view_image` | yes | load an image as MCP image content (+ size/format/resize metadata) |
 | `create_file` | no | create or overwrite a file |
 | `replace_in_file` | no | exact string replace (optional `replaceAll`) |
 | `append_to_file` | no | append text |
@@ -159,6 +166,9 @@ OpenAI docs: [ChatGPT developer mode](https://developers.openai.com/api/docs/gui
 | `get_command_output` | yes | poll a background job by `job_id` (optional `only_new`) |
 | `stop_command` | no | stop a background job (SIGTERM or force) |
 | `list_commands` | yes | list shell jobs in this MCP process |
+| `list_remote_skills` | yes | list Agent Skills (`SKILL.md`) from default remote-machine locations |
+| `read_remote_skill` | yes | read a skill by name (or path) from the remote machine |
+| `stop_session` | no | shut down the remote MCP server + tunnel |
 
 Paths are sandboxed the same way as `--edit` (relative only, no `..`, no
 symlinks). Write tools create undo history under `.git/pastepatch/history` (or

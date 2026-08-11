@@ -11,6 +11,7 @@ import {
   redactLargeFields,
   undoLatestChange,
 } from "../lib/history.js";
+import { acquireMcpLock, releaseMcpLock } from "../lib/mcp-lock.js";
 import { startMcpHttpServer } from "../lib/mcp-server.js";
 import { formatProjectBanner, resolveProjectRoot } from "../lib/project.js";
 import {
@@ -631,6 +632,16 @@ async function runMcp(args, packageInfo, logger) {
     );
   }
 
+  // Single-instance guard: one tunnel/MCP pair per machine so ChatGPT does not
+  // flip between processes when a second pastepatch --mcp is started.
+  await acquireMcpLock({
+    port,
+    root,
+    hostname,
+    packageName: command,
+  });
+  let lockHeld = true;
+
   process.stderr.write(
     formatProjectBanner({
       root,
@@ -642,23 +653,59 @@ async function runMcp(args, packageInfo, logger) {
     }),
   );
 
-  const mcp = await startMcpHttpServer({
-    root,
-    port,
-    host: "127.0.0.1",
-    version: packageInfo.version,
-    logger,
-    authToken,
-    allowedHosts: hostname ? [hostname] : [],
-    verbose: args.verbose,
-    allowOutside: args.allowOutside,
-  });
+  let tunnelHandle = null;
+  let mcp = null;
+  let shuttingDown = false;
+
+  const releaseLock = async () => {
+    if (!lockHeld) {
+      return;
+    }
+    lockHeld = false;
+    try {
+      await releaseMcpLock();
+    } catch (error) {
+      await logger(`MCP lock release failed: ${error.message || error}`);
+    }
+  };
+
+  const shutdown = async (signal) => {
+    if (shuttingDown) {
+      return;
+    }
+    shuttingDown = true;
+    process.stderr.write(`\nShutting down (${signal})...\n`);
+    tunnelHandle?.kill();
+    try {
+      await mcp?.close();
+    } catch {
+      // ignore close races
+    }
+    await releaseLock();
+    process.exit(0);
+  };
+
+  try {
+    mcp = await startMcpHttpServer({
+      root,
+      port,
+      host: "127.0.0.1",
+      version: packageInfo.version,
+      logger,
+      authToken,
+      allowedHosts: hostname ? [hostname] : [],
+      verbose: args.verbose,
+      allowOutside: args.allowOutside,
+      onStopSession: () => shutdown("stop_session"),
+    });
+  } catch (error) {
+    await releaseLock();
+    throw error;
+  }
 
   await logger(
     `MCP listening root=${root} port=${port} verbose=${args.verbose} allowOutside=${args.allowOutside}`,
   );
-
-  let tunnelHandle = null;
 
   if (tunnelMode === "config") {
     process.stderr.write("Starting Cloudflare Tunnel (local credentials + config)...\n");
@@ -691,7 +738,12 @@ async function runMcp(args, packageInfo, logger) {
     tunnelHandle.exitPromise.catch(async (error) => {
       process.stderr.write(`Error: ${error.message}\n`);
       await logger(`MCP tunnel error: ${error.message}`);
-      await mcp.close();
+      try {
+        await mcp?.close();
+      } catch {
+        // ignore
+      }
+      await releaseLock();
       process.exitCode = 1;
       process.exit(1);
     });
@@ -713,13 +765,6 @@ async function runMcp(args, packageInfo, logger) {
   }
 
   process.stderr.write("Press Ctrl+C to stop.\n");
-
-  const shutdown = async (signal) => {
-    process.stderr.write(`\nShutting down (${signal})...\n`);
-    tunnelHandle?.kill();
-    await mcp.close();
-    process.exit(0);
-  };
 
   process.on("SIGINT", () => {
     void shutdown("SIGINT");
@@ -1302,6 +1347,8 @@ Sandbox (default ON):
 Notes:
   Requires cloudflared. First time: ${command} --mcp --setup-tunnel
   Then: ${command} --mcp   (starts local MCP + tunnel from ~/.pastepatch/)
+  Only one --mcp process at a time (~/.pastepatch/mcp.lock). Stop the other first
+  (Ctrl+C, stop_session tool, or kill <pid>) so the tunnel/ChatGPT connection stays stable.
   ChatGPT plugin URL: https://<hostname>/mcp   Authentication: No Auth
   For full CLI help (all modes): ${command} --help
 `;
