@@ -154,7 +154,7 @@ OpenAI docs: [ChatGPT developer mode](https://developers.openai.com/api/docs/gui
 | `find_files` | yes | find files by name (`fd`, else `find`) |
 | `search` | yes | search contents (`rg`, else `grep`) |
 | `read_file` | yes | read a UTF-8 file (relative path) |
-| `view_image` | yes | load an image as MCP image content (+ size/format/resize metadata) |
+| `view_image` | yes | load a full-resolution image as MCP image content (+ size/format metadata) |
 | `create_file` | no | create or overwrite a file |
 | `replace_in_file` | no | exact string replace (optional `replaceAll`) |
 | `append_to_file` | no | append text |

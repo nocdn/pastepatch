@@ -37,9 +37,9 @@ async function writePng(filePath, width, height, color = { r: 220, g: 40, b: 40,
   return buffer;
 }
 
-test("viewImageFile returns image content and metadata for a small PNG", async () => {
+test("viewImageFile returns full-resolution image content and metadata", async () => {
   const root = await tempProject();
-  await writePng(path.join(root, "dot.png"), 32, 24);
+  const original = await writePng(path.join(root, "dot.png"), 32, 24);
 
   const result = await viewImageFile({ path: "dot.png", root });
   assert.equal(result.content.length, 2);
@@ -47,35 +47,36 @@ test("viewImageFile returns image content and metadata for a small PNG", async (
   assert.equal(result.content[1].type, "image");
   assert.equal(result.content[1].mimeType, "image/png");
   assert.ok(result.content[1].data.length > 20);
-  assert.match(result.content[0].text, /format:/i);
-  assert.match(result.content[0].text, /resized: no/i);
-  assert.equal(result.meta.resized, false);
+  assert.match(result.content[0].text, /format: png/i);
+  assert.match(result.content[0].text, /full_resolution: yes/i);
   assert.equal(result.meta.width, 32);
   assert.equal(result.meta.height, 24);
+  assert.equal(result.meta.bytes, original.length);
 
-  // Base64 decodes to a valid image
+  // Base64 is the exact original file
   const decoded = Buffer.from(result.content[1].data, "base64");
+  assert.deepEqual(decoded, original);
   const meta = await sharp(decoded).metadata();
   assert.equal(meta.width, 32);
   assert.equal(meta.height, 24);
 });
 
-test("viewImageFile resizes large images under max_dimension", async () => {
+test("viewImageFile keeps large images at full resolution (no resize)", async () => {
   const root = await tempProject();
-  await writePng(path.join(root, "big.png"), 2000, 1000);
+  const original = await writePng(path.join(root, "big.png"), 2000, 1000);
 
-  const result = await viewImageFile({ path: "big.png", root, maxDimension: 512 });
-  assert.equal(result.meta.resized, true);
-  assert.ok(result.meta.width <= 512);
-  assert.ok(result.meta.height <= 512);
-  assert.match(result.content[0].text, /resized: yes/i);
-  assert.equal(result.content[1].type, "image");
-  assert.ok(["image/jpeg", "image/png"].includes(result.content[1].mimeType));
+  const result = await viewImageFile({ path: "big.png", root });
+  assert.equal(result.meta.width, 2000);
+  assert.equal(result.meta.height, 1000);
+  assert.equal(result.meta.bytes, original.length);
+  assert.equal(result.content[1].mimeType, "image/png");
+  assert.match(result.content[0].text, /full_resolution: yes/i);
 
   const decoded = Buffer.from(result.content[1].data, "base64");
+  assert.deepEqual(decoded, original);
   const meta = await sharp(decoded).metadata();
-  assert.ok(meta.width <= 512);
-  assert.ok(meta.height <= 512);
+  assert.equal(meta.width, 2000);
+  assert.equal(meta.height, 1000);
 });
 
 test("viewImageFile rejects non-images and sandbox escapes", async () => {
@@ -123,6 +124,7 @@ test("MCP view_image tool returns type:image content", async () => {
     assert.ok(image, "expected image content block");
     assert.match(text.text, /Image: shot\.png/);
     assert.match(text.text, /mimeType:/);
+    assert.match(text.text, /full_resolution: yes/);
     assert.ok(image.data && image.mimeType);
     assert.ok(image.data.length > 20);
 
@@ -132,8 +134,7 @@ test("MCP view_image tool returns type:image content", async () => {
     assert.match(viewLog, /png/i);
     assert.match(viewLog, /image \d+(\.\d+)?\s*(B|KB|MB)/i);
     assert.match(viewLog, /sent \d+(\.\d+)?\s*(B|KB|MB) base64/i);
-    assert.match(viewLog, /resized no/i);
-    assert.match(viewLog, /reencoded no/i);
+    assert.match(viewLog, /full resolution/i);
 
     await client.close();
   } finally {
