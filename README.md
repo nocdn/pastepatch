@@ -162,8 +162,8 @@ OpenAI docs: [ChatGPT developer mode](https://developers.openai.com/api/docs/gui
 | `move_file` | no | rename/move within the project |
 | `undo_last_change` | no | undo the most recent pastepatch change set |
 | `handoff` | yes | detailed session report in one markdown code block for the next chat |
-| `run_command` | no | run a shell command (cwd = project); may background after wait; output capped |
-| `get_command_output` | yes | poll a background job by `job_id` (optional `only_new`) |
+| `run_command` | no | run a shell command (cwd = project); may background after wait; output default ~8k tail (buffer retains ~100k) |
+| `get_command_output` | yes | re-fetch a job's output by `job_id` (optional `only_new`; raise `max_output_chars` or use `0` for full retained buffer) |
 | `stop_command` | no | stop a background job (SIGTERM or force) |
 | `list_commands` | yes | list shell jobs in this MCP process |
 | `list_remote_skills` | yes | list Agent Skills (`SKILL.md`) from default remote-machine locations |

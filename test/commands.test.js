@@ -3,7 +3,14 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { createCommandRunner, isCommandBlocked, resolveShellInvocation } from "../lib/commands.js";
+import {
+  createCommandRunner,
+  DEFAULT_MAX_OUTPUT_CHARS,
+  EXTENDED_MAX_OUTPUT_CHARS,
+  HARD_MAX_OUTPUT_CHARS,
+  isCommandBlocked,
+  resolveShellInvocation,
+} from "../lib/commands.js";
 
 const tempDirectories = [];
 
@@ -83,6 +90,81 @@ test("blocked command throws before spawn", async () => {
   const runner = createCommandRunner({ root });
   try {
     assert.throws(() => runner.runCommand({ command: "rm -rf /" }), /blacklist|blocked/i);
+  } finally {
+    await runner.dispose();
+  }
+});
+
+test("command output defaults to 8k tail and can be extended via get_command_output", async () => {
+  assert.equal(DEFAULT_MAX_OUTPUT_CHARS, 8_000);
+  assert.equal(EXTENDED_MAX_OUTPUT_CHARS, 32_000);
+  assert.equal(HARD_MAX_OUTPUT_CHARS, 100_000);
+
+  const root = await tempRoot();
+  const runner = createCommandRunner({ root });
+  try {
+    // ~20k of distinctive output (marker every 100 chars)
+    const total = 20_000;
+    const command =
+      process.platform === "win32"
+        ? `node -e "process.stdout.write('x'.repeat(${total}))"`
+        : `node -e 'process.stdout.write("x".repeat(${total}))'`;
+
+    const first = await runner.runCommand({ command, waitMs: 15_000 });
+    assert.equal(first.status, "exited");
+    assert.equal(first.exitCode, 0);
+    assert.ok(first.jobId);
+    assert.ok(first.outputChars >= total * 0.9, `expected ~${total} retained, got ${first.outputChars}`);
+    assert.ok(
+      first.returnedChars <= DEFAULT_MAX_OUTPUT_CHARS,
+      `default return should be ≤${DEFAULT_MAX_OUTPUT_CHARS}, got ${first.returnedChars}`,
+    );
+    assert.match(first.text, /output truncated/i);
+    assert.match(first.text, /get_command_output/);
+    assert.match(first.text, new RegExp(`max_output_chars=${EXTENDED_MAX_OUTPUT_CHARS}`));
+    assert.match(first.text, /max_output_chars=0/);
+
+    // Extended re-fetch without re-running
+    const extended = runner.getCommandOutput({
+      jobId: first.jobId,
+      maxOutputChars: EXTENDED_MAX_OUTPUT_CHARS,
+    });
+    assert.equal(extended.status, "exited");
+    assert.ok(extended.returnedChars >= total * 0.9);
+    assert.ok(extended.returnedChars <= EXTENDED_MAX_OUTPUT_CHARS);
+    // Full payload is only 20k so extended should not need a truncation notice for the slice
+    assert.doesNotMatch(extended.text, /showing last \d+ of \d+ chars in this response/);
+
+    // Full (0) still works and stays within hard max
+    const full = runner.getCommandOutput({
+      jobId: first.jobId,
+      maxOutputChars: 0,
+    });
+    assert.ok(full.returnedChars >= total * 0.9);
+    assert.ok(full.maxOutputChars === HARD_MAX_OUTPUT_CHARS);
+  } finally {
+    await runner.dispose();
+  }
+});
+
+test("max_output_chars=0 on run_command returns full retained buffer", async () => {
+  const root = await tempRoot();
+  const runner = createCommandRunner({ root });
+  try {
+    const total = 12_000;
+    const command =
+      process.platform === "win32"
+        ? `node -e "process.stdout.write('y'.repeat(${total}))"`
+        : `node -e 'process.stdout.write("y".repeat(${total}))'`;
+
+    const result = await runner.runCommand({
+      command,
+      waitMs: 15_000,
+      maxOutputChars: 0,
+    });
+    assert.equal(result.status, "exited");
+    assert.ok(result.returnedChars >= total * 0.9);
+    assert.equal(result.maxOutputChars, HARD_MAX_OUTPUT_CHARS);
   } finally {
     await runner.dispose();
   }

@@ -57,6 +57,9 @@ test("start_here guide mentions tools and project root", () => {
   assert.match(guide, /read_remote_skill/);
   assert.match(guide, /stop_session/);
   assert.match(guide, /view_image/);
+  assert.match(guide, /~8k/);
+  assert.match(guide, /get_command_output/);
+  assert.match(guide, /max_output_chars/);
   assert.doesNotMatch(guide, /local coding agent/i);
   assert.doesNotMatch(guide, /## AGENTS\.md guidance/);
 });
