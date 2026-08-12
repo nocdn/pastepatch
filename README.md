@@ -148,7 +148,7 @@ OpenAI docs: [ChatGPT developer mode](https://developers.openai.com/api/docs/gui
 
 | tool | read-only | description |
 | --- | --- | --- |
-| `start_here` | yes | agent role, project root, tool guide — call at session start |
+| `start_here` | yes | agent role, project root, tool guide, plus project `AGENTS.md` when present — call at session start |
 | `project_info` | yes | absolute project root bound to this server |
 | `list_directory` | yes | list a directory (relative path) |
 | `find_files` | yes | find files by name (`fd`, else `find`) |

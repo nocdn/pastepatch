@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { buildHandoffReport, buildStartHereGuide } from "../lib/agent-prompt.js";
+import {
+  buildHandoffReport,
+  buildStartHereGuide,
+  loadProjectAgentsMd,
+} from "../lib/agent-prompt.js";
 import { formatProjectBanner, resolveProjectRoot } from "../lib/project.js";
 import { findFiles, searchContent } from "../lib/search.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -54,6 +58,44 @@ test("start_here guide mentions tools and project root", () => {
   assert.match(guide, /stop_session/);
   assert.match(guide, /view_image/);
   assert.doesNotMatch(guide, /local coding agent/i);
+  assert.doesNotMatch(guide, /## AGENTS\.md guidance/);
+});
+
+test("start_here guide appends AGENTS.md verbatim when provided", () => {
+  const agentsMd = "# Project rules\n\n- Prefer small diffs\n- Never invent APIs\n";
+  const guide = buildStartHereGuide({
+    root: "/tmp/proj",
+    version: "1.1.1",
+    agentsMd,
+  });
+  assert.match(guide, /## AGENTS\.md guidance/);
+  assert.match(guide, /authoritative project-specific agent instructions/i);
+  assert.ok(guide.endsWith(agentsMd) || guide.includes(agentsMd));
+  // Verbatim: exact body appears after the guidance intro (not fenced away).
+  const idx = guide.indexOf("## AGENTS.md guidance");
+  assert.ok(idx >= 0);
+  const section = guide.slice(idx);
+  assert.match(section, /# Project rules/);
+  assert.match(section, /- Prefer small diffs/);
+  assert.match(section, /- Never invent APIs/);
+  assert.doesNotMatch(section, /```[\s\S]*# Project rules/);
+});
+
+test("loadProjectAgentsMd reads file and follows symlinks", async () => {
+  const root = await tempProject();
+  assert.equal(await loadProjectAgentsMd(root), null);
+
+  const body = "Use conventional commits.\nKeep PRs small.\n";
+  await writeFile(path.join(root, "AGENTS.md"), body, "utf8");
+  assert.equal(await loadProjectAgentsMd(root), body);
+
+  const root2 = await tempProject();
+  const target = path.join(root2, "docs", "agent-rules.md");
+  await mkdir(path.dirname(target), { recursive: true });
+  const linkedBody = "Linked AGENTS rules for unique-token-agents-md.\n";
+  await writeFile(target, linkedBody, "utf8");
+  await symlink(target, path.join(root2, "AGENTS.md"));
+  assert.equal(await loadProjectAgentsMd(root2), linkedBody);
 });
 
 test("handoff report is wrapped in a markdown code block", () => {
@@ -152,6 +194,7 @@ test("MCP exposes search, find_files, start_here, handoff", async () => {
     assert.equal(start.isError, undefined);
     assert.match(toolText(start), /ChatGPT/i);
     assert.match(toolText(start), /MCP/);
+    assert.doesNotMatch(toolText(start), /## AGENTS\.md guidance/);
 
     const search = await client.callTool({
       name: "search",
@@ -173,6 +216,33 @@ test("MCP exposes search, find_files, start_here, handoff", async () => {
     });
     assert.equal(handoff.isError, undefined);
     assert.match(toolText(handoff), /```markdown/);
+
+    await client.close();
+  } finally {
+    await server.close();
+  }
+});
+
+test("MCP start_here includes project AGENTS.md when present", async () => {
+  const root = await tempProject();
+  const agentsBody =
+    "# Repo agent rules\n\nAlways run tests after edits.\nunique-agents-md-token-abc\n";
+  await writeFile(path.join(root, "AGENTS.md"), agentsBody, "utf8");
+
+  const port = await freePort();
+  const server = await startMcpHttpServer({ root, port, host: "127.0.0.1", version: "test" });
+
+  try {
+    const client = new Client({ name: "pastepatch-test", version: "0.0.0" });
+    const transport = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`));
+    await client.connect(transport);
+
+    const start = await client.callTool({ name: "start_here", arguments: {} });
+    assert.equal(start.isError, undefined);
+    const text = toolText(start);
+    assert.match(text, /## AGENTS\.md guidance/);
+    assert.match(text, /unique-agents-md-token-abc/);
+    assert.match(text, /Always run tests after edits/);
 
     await client.close();
   } finally {
