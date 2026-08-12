@@ -59,7 +59,7 @@ test("formatToolLogLine plain text matches prior shape", () => {
   assert.equal(display, plain);
 });
 
-test("formatToolLogLine colors status, tool, and line stats when enabled", () => {
+test("formatToolLogLine colors status and line stats; tool name stays default", () => {
   const { plain, display } = formatToolLogLine({
     ok: true,
     tool: "replace_in_file",
@@ -74,8 +74,13 @@ test("formatToolLogLine colors status, tool, and line stats when enabled", () =>
     "[mcp] [12:00:00] ✓ ok → replace_in_file: src/a.js; lines +7 / -2",
   );
   assert.match(display, new RegExp(`\\x1b\\[32m✓ ok\\x1b\\[0m`));
-  assert.match(display, new RegExp(`\\x1b\\[36mreplace_in_file\\x1b\\[0m`));
-  assert.match(display, new RegExp(`\\x1b\\[34m→\\x1b\\[0m`));
+  assert.match(display, new RegExp(`\\x1b\\[2m\\[${"12:00:00"}\\]\\x1b\\[0m`));
+  // Tool name and arrow are uncolored (default foreground).
+  assert.match(display, / → replace_in_file: /);
+  assert.doesNotMatch(display, /\x1b\[36mreplace_in_file/);
+  assert.doesNotMatch(display, /\x1b\[34m→/);
+  // Summary + details are dim (same as timestamp).
+  assert.match(display, /\x1b\[2msrc\/a\.js; lines /);
   assert.match(display, new RegExp(`\\x1b\\[32m\\+7\\x1b\\[0m`));
   assert.match(display, new RegExp(`\\x1b\\[31m-2\\x1b\\[0m`));
   // Strip ANSI → same as plain
