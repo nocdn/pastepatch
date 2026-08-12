@@ -53,6 +53,8 @@ pastepatch --mcp --setup-tunnel
 | `--no-tunnel` | localhost only (still requires `cloudflared` installed) |
 | `--auth-token <token>` | require `Authorization: Bearer` on MCP HTTP (ChatGPT usually wants No auth) |
 | `--no-auth` | explicitly disable bearer auth |
+| `--color` | force color on MCP tool logs (even when not a TTY) |
+| `--no-color` | disable color on MCP tool logs (also respects `NO_COLOR`) |
 | `-m`, `--message`, `--task <text>` | provide first-turn instructions for `--init` instead of being asked interactively |
 | `-i`, `--include <pattern>` | forward an include pattern to `@nocdn/ingest`; repeatable |
 | `-e`, `--exclude <pattern>` | forward an exclude pattern to `@nocdn/ingest`; repeatable |

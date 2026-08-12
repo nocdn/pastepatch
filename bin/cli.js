@@ -110,6 +110,8 @@ function parseArgs(argv, packageInfo) {
     verbose: false,
     allowHome: false,
     allowOutside: false,
+    /** null = auto (TTY + env), true = --color, false = --no-color */
+    color: null,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -188,6 +190,16 @@ function parseArgs(argv, packageInfo) {
 
     if (arg === "--verbose") {
       args.verbose = true;
+      continue;
+    }
+
+    if (arg === "--no-color") {
+      args.color = false;
+      continue;
+    }
+
+    if (arg === "--color") {
+      args.color = true;
       continue;
     }
 
@@ -697,6 +709,7 @@ async function runMcp(args, packageInfo, logger) {
       verbose: args.verbose,
       allowOutside: args.allowOutside,
       onStopSession: () => shutdown("stop_session"),
+      color: args.color,
     });
   } catch (error) {
     await releaseLock();
@@ -1320,6 +1333,7 @@ Examples:
   ${command} --mcp --setup-tunnel --hostname pastepatch
   ${command} --mcp --no-tunnel
   ${command} --mcp --verbose
+  ${command} --mcp --no-color
   ${command} --mcp --allow-outside
 
 Options:
@@ -1334,6 +1348,8 @@ Options:
   --auth-token <token>             Require Authorization: Bearer. Env: PASTEPATCH_MCP_TOKEN.
   --no-auth                        Disable bearer auth (default; use ChatGPT "No Auth").
   --verbose                        Cloudflared/HTTP logs + replace/create payload previews.
+  --color                          Force color on MCP tool logs (even when not a TTY).
+  --no-color                       Disable color on MCP tool logs (also respects NO_COLOR).
   --allow-home                     Allow binding project root to $HOME or filesystem root.
   --allow-outside                  Disable path sandbox (allow absolute paths and paths outside the project).
                                    Default is sandboxed: cannot read/create/edit/delete outside the bound root.

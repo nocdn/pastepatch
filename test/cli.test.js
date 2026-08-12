@@ -33,6 +33,8 @@ test("--mcp -h shows MCP-only help", async () => {
   assert.match(result.stdout, /MCP mode/);
   assert.match(result.stdout, /--allow-outside/);
   assert.match(result.stdout, /--setup-tunnel/);
+  assert.match(result.stdout, /--no-color/);
+  assert.match(result.stdout, /--color/);
   assert.match(result.stdout, /Sandbox/);
   assert.doesNotMatch(result.stdout, /--dry-run/);
   assert.doesNotMatch(result.stdout, /@nocdn\/ingest/);
