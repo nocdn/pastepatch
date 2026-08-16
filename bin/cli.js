@@ -21,6 +21,7 @@ import {
   saveTunnelConfig,
   setupTunnelInteractive,
   startCloudflaredWithConfig,
+  startCloudflaredWithReconnect,
   startCloudflaredWithToken,
   writeCloudflaredConfigFile,
 } from "../lib/tunnel.js";
@@ -725,41 +726,36 @@ async function runMcp(args, packageInfo, logger) {
     if (!args.verbose) {
       process.stderr.write("Tunnel logs quiet (pass --verbose for cloudflared/HTTP details).\n");
     }
-    tunnelHandle = startCloudflaredWithConfig({
-      binary,
-      configFile: tunnelConfigFile,
-      tunnelIdOrName,
+    tunnelHandle = startCloudflaredWithReconnect({
+      start: () =>
+        startCloudflaredWithConfig({
+          binary,
+          configFile: tunnelConfigFile,
+          tunnelIdOrName,
+          logger,
+          verbose: args.verbose,
+        }),
       logger,
-      verbose: args.verbose,
+      isShuttingDown: () => shuttingDown,
     });
   } else if (tunnelMode === "token") {
     process.stderr.write("Starting Cloudflare Tunnel (token)...\n");
     if (!args.verbose) {
       process.stderr.write("Tunnel logs quiet (pass --verbose for cloudflared/HTTP details).\n");
     }
-    tunnelHandle = startCloudflaredWithToken({
-      token: envToken,
-      binary,
+    tunnelHandle = startCloudflaredWithReconnect({
+      start: () =>
+        startCloudflaredWithToken({
+          token: envToken,
+          binary,
+          logger,
+          verbose: args.verbose,
+        }),
       logger,
-      verbose: args.verbose,
+      isShuttingDown: () => shuttingDown,
     });
   } else {
     process.stderr.write("Tunnel disabled (--no-tunnel). MCP is only on localhost.\n");
-  }
-
-  if (tunnelHandle) {
-    tunnelHandle.exitPromise.catch(async (error) => {
-      process.stderr.write(`Error: ${error.message}\n`);
-      await logger(`MCP tunnel error: ${error.message}`);
-      try {
-        await mcp?.close();
-      } catch {
-        // ignore
-      }
-      await releaseLock();
-      process.exitCode = 1;
-      process.exit(1);
-    });
   }
 
   if (hostname) {

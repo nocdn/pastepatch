@@ -147,6 +147,160 @@ test("command output defaults to 8k tail and can be extended via get_command_out
   }
 });
 
+test("session env and cwd persist across run_command calls", async () => {
+  const root = await tempRoot();
+  const runner = createCommandRunner({ root });
+  try {
+    runner.setSession({ env: { PASTEPATCH_TEST_MARK: "from-session" }, cwd: "." });
+    const result = await runner.runCommand({
+      command:
+        process.platform === "win32"
+          ? "echo %PASTEPATCH_TEST_MARK%"
+          : "printf '%s\\n' \"$PASTEPATCH_TEST_MARK\"",
+      waitMs: 10_000,
+    });
+    assert.equal(result.status, "exited");
+    assert.match(result.text, /from-session/);
+    assert.match(result.text, /pid=/);
+    assert.ok(result.pid);
+
+    const snapshot = runner.getSession();
+    assert.equal(snapshot.env.PASTEPATCH_TEST_MARK, "from-session");
+    assert.match(runner.formatSession(snapshot), /PASTEPATCH_TEST_MARK/);
+  } finally {
+    await runner.dispose();
+  }
+});
+
+test("activate venv prepends bin to PATH", async () => {
+  const root = await tempRoot();
+  const runner = createCommandRunner({ root });
+  try {
+    const venv = path.join(root, "venv");
+    const bin = path.join(venv, process.platform === "win32" ? "Scripts" : "bin");
+    const { mkdir, writeFile, chmod } = await import("node:fs/promises");
+    await mkdir(bin, { recursive: true });
+    if (process.platform === "win32") {
+      await writeFile(path.join(bin, "python.exe"), "", "utf8");
+    } else {
+      await writeFile(path.join(bin, "python"), "#!/bin/sh\necho fake-python\n", "utf8");
+      await chmod(path.join(bin, "python"), 0o755);
+    }
+
+    runner.setSession({ venv });
+    const result = await runner.runCommand({
+      command: process.platform === "win32" ? "echo %VIRTUAL_ENV%" : "printf '%s\\n' \"$VIRTUAL_ENV\"",
+      waitMs: 10_000,
+    });
+    assert.match(result.text, new RegExp(venv.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&")));
+  } finally {
+    await runner.dispose();
+  }
+});
+
+test("get_command_output can filter by stream, grep, and line range", async () => {
+  const root = await tempRoot();
+  const runner = createCommandRunner({ root });
+  try {
+    const command =
+      process.platform === "win32"
+        ? `node -e "console.log('keep-alpha'); console.log('skip'); console.error('err-line'); console.log('keep-beta')"`
+        : `node -e 'console.log("keep-alpha"); console.log("skip"); console.error("err-line"); console.log("keep-beta")'`;
+    const ran = await runner.runCommand({ command, waitMs: 10_000 });
+    assert.equal(ran.status, "exited");
+
+    const stdout = runner.getCommandOutput({ jobId: ran.jobId, stream: "stdout", maxOutputChars: 0 });
+    assert.match(stdout.text, /keep-alpha/);
+    assert.doesNotMatch(stdout.text, /err-line/);
+
+    const stderr = runner.getCommandOutput({ jobId: ran.jobId, stream: "stderr", maxOutputChars: 0 });
+    assert.match(stderr.text, /err-line/);
+    assert.doesNotMatch(stderr.text, /keep-alpha/);
+
+    const grepped = runner.getCommandOutput({
+      jobId: ran.jobId,
+      stream: "stdout",
+      grep: "keep-",
+      maxOutputChars: 0,
+    });
+    assert.match(grepped.text, /keep-alpha/);
+    assert.match(grepped.text, /keep-beta/);
+    assert.doesNotMatch(grepped.text, /^skip$/m);
+
+    const sliced = runner.getCommandOutput({
+      jobId: ran.jobId,
+      stream: "stdout",
+      lineOffset: 1,
+      lineLimit: 1,
+      maxOutputChars: 0,
+    });
+    assert.match(sliced.text, /keep-alpha/);
+    assert.doesNotMatch(sliced.text, /keep-beta/);
+  } finally {
+    await runner.dispose();
+  }
+});
+
+test("stop_command kills child processes in the job group", async () => {
+  if (process.platform === "win32") {
+    return;
+  }
+  const root = await tempRoot();
+  const runner = createCommandRunner({ root });
+  try {
+    const started = await runner.runCommand({
+      command: "sleep 120",
+      waitMs: 300,
+    });
+    assert.equal(started.status, "running");
+    assert.ok(started.pid);
+
+    const { isPidAlive } = await import("../lib/process-tree.js");
+    assert.equal(isPidAlive(started.pid), true);
+
+    const stopped = await runner.stopCommand({ jobId: started.jobId, force: true });
+    assert.match(stopped.message, /SIGKILL|process group/i);
+
+    await new Promise((r) => setTimeout(r, 250));
+    assert.equal(isPidAlive(started.pid), false);
+  } finally {
+    await runner.dispose();
+  }
+});
+
+test("terminate_process refuses pids this session did not launch", async () => {
+  const root = await tempRoot();
+  const runner = createCommandRunner({ root });
+  try {
+    assert.throws(
+      () => runner.terminateProcess({ pid: process.pid }),
+      /not owned|Refusing/i,
+    );
+    assert.throws(() => runner.terminateProcess({ pid: 1 }), /must be an integer > 1|Refusing/i);
+  } finally {
+    await runner.dispose();
+  }
+});
+
+test("stop_all_session_processes stops running jobs", async () => {
+  if (process.platform === "win32") {
+    return;
+  }
+  const root = await tempRoot();
+  const runner = createCommandRunner({ root });
+  try {
+    const started = await runner.runCommand({ command: "sleep 120", waitMs: 300 });
+    assert.equal(started.status, "running");
+    const result = await runner.stopAllSessionProcesses({ force: true });
+    assert.ok(result.stoppedJobs.includes(started.jobId));
+    await new Promise((r) => setTimeout(r, 200));
+    const after = runner.getCommandOutput({ jobId: started.jobId });
+    assert.equal(after.status, "exited");
+  } finally {
+    await runner.dispose();
+  }
+});
+
 test("max_output_chars=0 on run_command returns full retained buffer", async () => {
   const root = await tempRoot();
   const runner = createCommandRunner({ root });

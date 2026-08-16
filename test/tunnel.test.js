@@ -13,6 +13,7 @@ import {
   padTable,
   pastepatchCloudflaredConfigPath,
   pastepatchTunnelConfigPath,
+  startCloudflaredWithReconnect,
   subdomainFromHostname,
 } from "../lib/tunnel.js";
 
@@ -82,6 +83,40 @@ test("hostname helpers build subdomain under authenticated zone", () => {
     "pastepatch.bartoszbak.org",
   );
   assert.throws(() => buildHostname("bad.sub", "bartoszbak.org"), /Invalid subdomain/);
+});
+
+test("startCloudflaredWithReconnect restarts after unexpected exit and stop kills the loop", async () => {
+  let starts = 0;
+  const handle = startCloudflaredWithReconnect({
+    start: () => {
+      starts += 1;
+      let rejectExit;
+      const exitPromise = new Promise((_, reject) => {
+        rejectExit = reject;
+      });
+      if (starts === 1) {
+        setTimeout(() => rejectExit(new Error("boom")), 10);
+      }
+      return {
+        child: { pid: starts },
+        exitPromise,
+        kill() {},
+      };
+    },
+    logger: async () => {},
+    initialDelayMs: 20,
+    maxDelayMs: 20,
+  });
+
+  const deadline = Date.now() + 1_000;
+  while (starts < 2 && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  assert.ok(starts >= 2, `expected reconnect, starts=${starts}`);
+  handle.kill();
+  const after = starts;
+  await new Promise((r) => setTimeout(r, 60));
+  assert.equal(starts, after);
 });
 
 test("setup complete message includes ChatGPT field table with No Auth", () => {

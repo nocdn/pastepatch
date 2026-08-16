@@ -130,6 +130,8 @@ Uses the saved tunnel config automatically. Starts:
 - Public URL: `https://mcp.bartoszbak.org/mcp` (your hostname from setup)
 - Legacy SSE: `https://mcp.bartoszbak.org/sse`
 
+If `cloudflared` exits unexpectedly, pastepatch **restarts the tunnel** with backoff and leaves the local MCP server up. ChatGPT may still need to retry a dropped call.
+
 Only **one** `pastepatch --mcp` process may run at a time on a machine (lock file
 `~/.pastepatch/mcp.lock`). A second start exits with instructions to stop the
 other session first — otherwise the shared Cloudflare tunnel can drop or scramble
@@ -155,7 +157,9 @@ OpenAI docs: [ChatGPT developer mode](https://developers.openai.com/api/docs/gui
 | `list_directory` | yes | list a directory (relative path) |
 | `find_files` | yes | find files by name (`fd`, else `find`) |
 | `search` | yes | search contents (`rg`, else `grep`) |
-| `read_file` | yes | read a UTF-8 file (relative path) |
+| `read_file` | yes | read a UTF-8 file (relative path); optional `line_offset` / `line_limit` / `grep` |
+| `get_process_tree` | yes | ancestors + children for a `pid` or exact process/app name |
+| `quit_app` | no | quit a running macOS app by exact name (GUI supervisors such as Ollama) |
 | `view_image` | yes | load a full-resolution image as MCP image content (+ size/format metadata) |
 | `create_file` | no | create or overwrite a file |
 | `replace_in_file` | no | exact string replace (optional `replaceAll`) |
@@ -164,10 +168,15 @@ OpenAI docs: [ChatGPT developer mode](https://developers.openai.com/api/docs/gui
 | `move_file` | no | rename/move within the project |
 | `undo_last_change` | no | undo the most recent pastepatch change set |
 | `handoff` | yes | detailed session report in one markdown code block for the next chat |
-| `run_command` | no | run a shell command (cwd = project); may background after wait; output default ~8k tail (buffer retains ~100k) |
-| `get_command_output` | yes | re-fetch a job's output by `job_id` (optional `only_new`; raise `max_output_chars` or use `0` for full retained buffer) |
-| `stop_command` | no | stop a background job (SIGTERM or force) |
-| `list_commands` | yes | list shell jobs in this MCP process |
+| `run_command` | no | run a shell command (cwd = session cwd or project); may background after wait; output default ~8k tail (buffer retains ~100k). Jobs are process-group + env-tagged to this MCP session |
+| `get_command_output` | yes | re-fetch a job's output by `job_id` (`only_new`, `stream`, `grep`, `line_offset` / `line_limit`; raise `max_output_chars` or `0` for full retained buffer) |
+| `stop_command` | no | stop a background job (SIGTERM or force); kills the process group and session-tagged descendants |
+| `terminate_process` | no | safer kill: `job_id` or a pid **owned by this session** only (identity-checked) |
+| `stop_all_session_processes` | no | stop every job + leftover session-tagged pids from this MCP process |
+| `list_commands` | yes | list shell jobs in this MCP process (includes pid) |
+| `get_session` / `set_session` | mixed | persistent cwd / env overlay / venv for later `run_command` (not a PTY) |
+| `wait_until` | yes | block until port / HTTP / job exit / pid exit / file size stable / output regex |
+| `http_request` | no | HTTP to loopback by default (`allow_public` to unlock other hosts) |
 | `list_remote_skills` | yes | list Agent Skills (`SKILL.md`) from default remote-machine locations |
 | `read_remote_skill` | yes | read a skill by name (or path) from the remote machine |
 | `stop_session` | no | shut down the remote MCP server + tunnel |

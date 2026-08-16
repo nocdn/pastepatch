@@ -60,6 +60,14 @@ test("start_here guide mentions tools and project root", () => {
   assert.match(guide, /~8k/);
   assert.match(guide, /get_command_output/);
   assert.match(guide, /max_output_chars/);
+  assert.match(guide, /set_session/);
+  assert.match(guide, /wait_until/);
+  assert.match(guide, /http_request/);
+  assert.match(guide, /stop_all_session_processes/);
+  assert.match(guide, /terminate_process/);
+  assert.match(guide, /get_process_tree/);
+  assert.match(guide, /quit_app/);
+  assert.match(guide, /line_offset/);
   assert.doesNotMatch(guide, /local coding agent/i);
   assert.doesNotMatch(guide, /## AGENTS\.md guidance/);
 });
@@ -189,6 +197,14 @@ test("MCP exposes search, find_files, start_here, handoff", async () => {
       "read_remote_skill",
       "stop_session",
       "view_image",
+      "get_session",
+      "set_session",
+      "wait_until",
+      "http_request",
+      "terminate_process",
+      "stop_all_session_processes",
+      "get_process_tree",
+      "quit_app",
     ]) {
       assert.ok(names.has(name), `missing tool ${name}`);
     }

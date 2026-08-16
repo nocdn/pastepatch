@@ -52,10 +52,32 @@ test("MCP tools can read and write files under the project root", async () => {
     assert.ok(names.includes("read_file"));
     assert.ok(names.includes("create_file"));
     assert.ok(names.includes("replace_in_file"));
+    assert.ok(names.includes("http_request"));
+    assert.ok(names.includes("wait_until"));
+    assert.ok(names.includes("get_session"));
+    assert.ok(names.includes("terminate_process"));
 
     const read = await client.callTool({ name: "read_file", arguments: { path: "README.md" } });
     assert.equal(read.isError, undefined);
     assert.match(toolText(read), /hello world/);
+
+    await writeFile(path.join(root, "lines.txt"), "one\ntwo\nthree\nfour\n", "utf8");
+    const sliced = await client.callTool({
+      name: "read_file",
+      arguments: { path: "lines.txt", line_offset: 2, line_limit: 2 },
+    });
+    assert.equal(sliced.isError, undefined);
+    assert.match(toolText(sliced), /two/);
+    assert.match(toolText(sliced), /three/);
+    assert.doesNotMatch(toolText(sliced), /^four$/m);
+    assert.match(toolText(sliced), /total_lines=4/);
+
+    const tree = await client.callTool({
+      name: "get_process_tree",
+      arguments: { pid: process.pid },
+    });
+    assert.equal(tree.isError, undefined);
+    assert.match(toolText(tree), /\[requested\]/);
 
     const create = await client.callTool({
       name: "create_file",
@@ -77,6 +99,64 @@ test("MCP tools can read and write files under the project root", async () => {
     });
     assert.equal(bad.isError, true);
     assert.match(toolText(bad), /\.\./);
+
+    await client.close();
+  } finally {
+    await server.close();
+  }
+});
+
+test("MCP session, http_request, and wait_until tools work", async () => {
+  const root = await tempProject();
+  const port = await freePort();
+  const server = await startMcpHttpServer({
+    root,
+    port,
+    host: "127.0.0.1",
+    version: "test",
+  });
+
+  try {
+    const client = new Client({ name: "pastepatch-test", version: "0.0.0" });
+    const transport = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`));
+    await client.connect(transport);
+
+    const session = await client.callTool({
+      name: "set_session",
+      arguments: { env: { PASTEPATCH_TEST_MARK: "via-mcp" } },
+    });
+    assert.equal(session.isError, undefined);
+    assert.match(toolText(session), /PASTEPATCH_TEST_MARK=via-mcp/);
+
+    const ran = await client.callTool({
+      name: "run_command",
+      arguments: {
+        command: process.platform === "win32" ? "echo %PASTEPATCH_TEST_MARK%" : "printf '%s\\n' \"$PASTEPATCH_TEST_MARK\"",
+      },
+    });
+    assert.equal(ran.isError, undefined);
+    assert.match(toolText(ran), /via-mcp/);
+
+    const http = await client.callTool({
+      name: "http_request",
+      arguments: { url: `http://127.0.0.1:${port}/healthz` },
+    });
+    assert.equal(http.isError, undefined);
+    assert.match(toolText(http), /"ok": true/);
+
+    const blocked = await client.callTool({
+      name: "http_request",
+      arguments: { url: "https://example.com/" },
+    });
+    assert.equal(blocked.isError, true);
+    assert.match(toolText(blocked), /loopback/i);
+
+    const waited = await client.callTool({
+      name: "wait_until",
+      arguments: { condition: "port_open", port, timeout_ms: 3000 },
+    });
+    assert.equal(waited.isError, undefined);
+    assert.match(toolText(waited), /satisfied/);
 
     await client.close();
   } finally {
