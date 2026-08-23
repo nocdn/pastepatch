@@ -12,6 +12,7 @@
     "pastepatch": "bin/cli.js"
   },
   "files": [
+    "assets",
     "bin",
     "lib",
     "README.md"
